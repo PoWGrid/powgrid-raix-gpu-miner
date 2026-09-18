@@ -1,0 +1,22 @@
+[package]
+name = "powgrid-raix-gpu-miner"
+version = "1.1.0"
+edition = "2021"
+authors = ["PowGrid Community Developers"]
+description = "High-performance dual-engine (CUDA + OpenCL) RandomX GPU miner for Reticulum AI ($RAIX)"
+license = "MIT OR Apache-2.0"
+keywords = ["raix", "reticulum", "randomx", "cuda", "opencl"]
+
+[dependencies]
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version = "2.9", features = ["json"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

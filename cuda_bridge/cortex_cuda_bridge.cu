@@ -1,0 +1,772 @@
+#include "cortex_cuda_bridge.h"
+#include <cuda_runtime.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#include "k256.cuh"
+#include "k512.cuh"
+
+#define ROTR64(x, n) (((x) >> (n)) | ((x) << (64 - (n))))
+#define CH64(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
+#define MAJ64(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define EP0_512(x) (ROTR64(x, 28) ^ ROTR64(x, 34) ^ ROTR64(x, 39))
+#define EP1_512(x) (ROTR64(x, 14) ^ ROTR64(x, 18) ^ ROTR64(x, 41))
+#define SIG0_512(x) (ROTR64(x, 1) ^ ROTR64(x, 8) ^ ((x) >> 7))
+#define SIG1_512(x) (ROTR64(x, 19) ^ ROTR64(x, 61) ^ ((x) >> 6))
+
+__device__ void sha512_transform(uint64_t state[8], const uint8_t data[128]) {
+    uint64_t w[80];
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint64_t)data[i * 8 + 0] << 56) |
+               ((uint64_t)data[i * 8 + 1] << 48) |
+               ((uint64_t)data[i * 8 + 2] << 40) |
+               ((uint64_t)data[i * 8 + 3] << 32) |
+               ((uint64_t)data[i * 8 + 4] << 24) |
+               ((uint64_t)data[i * 8 + 5] << 16) |
+               ((uint64_t)data[i * 8 + 6] << 8)  |
+               ((uint64_t)data[i * 8 + 7]);
+    }
+    for (int i = 16; i < 80; i++) {
+        w[i] = SIG1_512(w[i - 2]) + w[i - 7] + SIG0_512(w[i - 15]) + w[i - 16];
+    }
+    uint64_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint64_t e = state[4], f = state[5], g = state[6], h = state[7];
+    for (int i = 0; i < 80; i++) {
+        uint64_t t1 = h + EP1_512(e) + CH64(e, f, g) + K512[i] + w[i];
+        uint64_t t2 = EP0_512(a) + MAJ64(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+__device__ void cuda_sha512(const uint8_t* data, int len, uint8_t digest[64]) {
+    uint64_t state[8] = {
+        0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+        0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+        0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+        0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
+    };
+    uint8_t block[128];
+    int offset = 0;
+    while (offset + 128 <= len) {
+        sha512_transform(state, data + offset);
+        offset += 128;
+    }
+    int rem = len - offset;
+    for (int i = 0; i < rem; i++) block[i] = data[offset + i];
+    block[rem] = 0x80;
+    rem++;
+    if (rem > 112) {
+        for (int i = rem; i < 128; i++) block[i] = 0;
+        sha512_transform(state, block);
+        rem = 0;
+    }
+    for (int i = rem; i < 120; i++) block[i] = 0;
+    uint64_t bits = (uint64_t)len * 8ULL;
+    block[120] = (uint8_t)(bits >> 56);
+    block[121] = (uint8_t)(bits >> 48);
+    block[122] = (uint8_t)(bits >> 40);
+    block[123] = (uint8_t)(bits >> 32);
+    block[124] = (uint8_t)(bits >> 24);
+    block[125] = (uint8_t)(bits >> 16);
+    block[126] = (uint8_t)(bits >> 8);
+    block[127] = (uint8_t)(bits);
+    sha512_transform(state, block);
+    for (int i = 0; i < 8; i++) {
+        digest[i * 8 + 0] = (uint8_t)(state[i] >> 56);
+        digest[i * 8 + 1] = (uint8_t)(state[i] >> 48);
+        digest[i * 8 + 2] = (uint8_t)(state[i] >> 40);
+        digest[i * 8 + 3] = (uint8_t)(state[i] >> 32);
+        digest[i * 8 + 4] = (uint8_t)(state[i] >> 24);
+        digest[i * 8 + 5] = (uint8_t)(state[i] >> 16);
+        digest[i * 8 + 6] = (uint8_t)(state[i] >> 8);
+        digest[i * 8 + 7] = (uint8_t)(state[i]);
+    }
+}
+
+__device__ void cuda_sha512_64bytes(const uint8_t key_in[64], uint8_t digest[64]) {
+    uint64_t state[8] = {
+        0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+        0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+        0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+        0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
+    };
+    uint8_t block[128];
+    for (int i = 0; i < 64; i++) block[i] = key_in[i];
+    block[64] = 0x80;
+    for (int i = 65; i < 120; i++) block[i] = 0;
+    block[120] = 0; block[121] = 0; block[122] = 0; block[123] = 0;
+    block[124] = 0; block[125] = 0; block[126] = 2; block[127] = 0;
+    sha512_transform(state, block);
+    for (int i = 0; i < 8; i++) {
+        digest[i * 8 + 0] = (uint8_t)(state[i] >> 56);
+        digest[i * 8 + 1] = (uint8_t)(state[i] >> 48);
+        digest[i * 8 + 2] = (uint8_t)(state[i] >> 40);
+        digest[i * 8 + 3] = (uint8_t)(state[i] >> 32);
+        digest[i * 8 + 4] = (uint8_t)(state[i] >> 24);
+        digest[i * 8 + 5] = (uint8_t)(state[i] >> 16);
+        digest[i * 8 + 6] = (uint8_t)(state[i] >> 8);
+        digest[i * 8 + 7] = (uint8_t)(state[i]);
+    }
+}
+
+#define ROTR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define CH32(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
+#define MAJ32(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define EP0_256(x) (ROTR32(x, 2) ^ ROTR32(x, 13) ^ ROTR32(x, 22))
+#define EP1_256(x) (ROTR32(x, 6) ^ ROTR32(x, 11) ^ ROTR32(x, 25))
+#define SIG0_256(x) (ROTR32(x, 7) ^ ROTR32(x, 18) ^ ((x) >> 3))
+#define SIG1_256(x) (ROTR32(x, 17) ^ ROTR32(x, 19) ^ ((x) >> 10))
+
+__device__ void sha256_transform(uint32_t state[8], const uint8_t data[64]) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)data[i * 4 + 0] << 24) |
+               ((uint32_t)data[i * 4 + 1] << 16) |
+               ((uint32_t)data[i * 4 + 2] << 8)  |
+               ((uint32_t)data[i * 4 + 3]);
+    }
+    for (int i = 16; i < 64; i++) {
+        w[i] = SIG1_256(w[i - 2]) + w[i - 7] + SIG0_256(w[i - 15]) + w[i - 16];
+    }
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t t1 = h + EP1_256(e) + CH32(e, f, g) + K256[i] + w[i];
+        uint32_t t2 = EP0_256(a) + MAJ32(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+}
+
+__device__ void cuda_sha256_64bytes(const uint8_t data[64], uint8_t digest[32]) {
+    uint32_t state[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    sha256_transform(state, data);
+    uint8_t block[64];
+    block[0] = 0x80;
+    for (int i = 1; i < 56; i++) block[i] = 0;
+    block[56] = 0; block[57] = 0; block[58] = 0; block[59] = 0;
+    block[60] = 0; block[61] = 0; block[62] = 2; block[63] = 0;
+    sha256_transform(state, block);
+    for (int i = 0; i < 8; i++) {
+        digest[i * 4 + 0] = (uint8_t)(state[i] >> 24);
+        digest[i * 4 + 1] = (uint8_t)(state[i] >> 16);
+        digest[i * 4 + 2] = (uint8_t)(state[i] >> 8);
+        digest[i * 4 + 3] = (uint8_t)(state[i]);
+    }
+}
+
+__device__ void cuda_sha256_sponge(const uint8_t h1[32], const int64_t* scratchpad, uint8_t digest[32]) {
+    uint32_t state[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    uint8_t block[64];
+
+    // Block 0: h1[0..31] + scratchpad[0..3]
+    for (int i = 0; i < 32; i++) block[i] = h1[i];
+    for (int i = 0; i < 4; i++) {
+        uint64_t val = (uint64_t)scratchpad[i];
+        for (int b = 0; b < 8; b++) block[32 + i * 8 + b] = (uint8_t)(val >> (b * 8));
+    }
+    sha256_transform(state, block);
+
+    // Blocks 1..7: scratchpad[4 + (blk-1)*8 .. 4 + (blk-1)*8 + 7]
+    for (int blk = 1; blk <= 7; blk++) {
+        int baseIdx = 4 + (blk - 1) * 8;
+        for (int i = 0; i < 8; i++) {
+            uint64_t val = (uint64_t)scratchpad[baseIdx + i];
+            for (int b = 0; b < 8; b++) block[i * 8 + b] = (uint8_t)(val >> (b * 8));
+        }
+        sha256_transform(state, block);
+    }
+
+    // Block 8: scratchpad[60..63] + padding + 4352 bits
+    for (int i = 0; i < 4; i++) {
+        uint64_t val = (uint64_t)scratchpad[60 + i];
+        for (int b = 0; b < 8; b++) block[i * 8 + b] = (uint8_t)(val >> (b * 8));
+    }
+    block[32] = 0x80;
+    for (int i = 33; i < 56; i++) block[i] = 0;
+    uint64_t bits = 544ULL * 8;
+    for (int i = 0; i < 8; i++) block[56 + i] = (uint8_t)(bits >> ((7 - i) * 8));
+    sha256_transform(state, block);
+
+    for (int i = 0; i < 8; i++) {
+        digest[i * 4 + 0] = (uint8_t)(state[i] >> 24);
+        digest[i * 4 + 1] = (uint8_t)(state[i] >> 16);
+        digest[i * 4 + 2] = (uint8_t)(state[i] >> 8);
+        digest[i * 4 + 3] = (uint8_t)(state[i]);
+    }
+}
+
+__device__ int u64_to_str(uint64_t val, char* out) {
+    if (val == 0) {
+        out[0] = '0';
+        return 1;
+    }
+    char temp[32];
+    int len = 0;
+    while (val > 0) {
+        temp[len++] = '0' + (val % 10);
+        val /= 10;
+    }
+    for (int i = 0; i < len; i++) {
+        out[i] = temp[len - 1 - i];
+    }
+    return len;
+}
+
+#define MAX_SOLUTIONS 32
+
+__global__ void cortex_mine_kernel(
+    const char* d_prefix, int prefix_len,
+    const char* d_suffix, int suffix_len,
+    const char* d_seed, int seed_len,
+    int target_diff,
+    uint64_t target_u64,
+    uint64_t base_nonce,
+    int nonces_per_thread,
+    int64_t* d_scratchpads,
+    int* d_found_count,
+    uint64_t* d_found_nonces
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = gridDim.x * blockDim.x;
+
+    for (int iter_nonce = 0; iter_nonce < nonces_per_thread; iter_nonce++) {
+        uint64_t nonce = base_nonce + (uint64_t)iter_nonce * (uint64_t)total_threads + (uint64_t)tid;
+
+        char header[512];
+        for (int i = 0; i < prefix_len; i++) header[i] = d_prefix[i];
+        int nonce_len = u64_to_str(nonce, header + prefix_len);
+        int cur_len = prefix_len + nonce_len;
+        for (int i = 0; i < suffix_len; i++) header[cur_len + i] = d_suffix[i];
+        int header_len = cur_len + suffix_len;
+
+        // 1. key = sha512(header + ":" + seed)
+        header[header_len] = ':';
+        for (int i = 0; i < seed_len; i++) header[header_len + 1 + i] = d_seed[i];
+        int hs_len = header_len + 1 + seed_len;
+
+        uint8_t key[64];
+        cuda_sha512((const uint8_t*)header, hs_len, key);
+        header[header_len] = 0;
+
+        // Scratchpad initialization (Coalesced)
+        for (int i = 0; i < 4096; i += 8) {
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                uint64_t val = ((uint64_t)key[j * 8 + 0]) |
+                               (((uint64_t)key[j * 8 + 1]) << 8) |
+                               (((uint64_t)key[j * 8 + 2]) << 16) |
+                               (((uint64_t)key[j * 8 + 3]) << 24) |
+                               (((uint64_t)key[j * 8 + 4]) << 32) |
+                               (((uint64_t)key[j * 8 + 5]) << 40) |
+                               (((uint64_t)key[j * 8 + 6]) << 48) |
+                               (((uint64_t)key[j * 8 + 7]) << 56);
+                d_scratchpads[(size_t)(i + j) * total_threads + tid] = (int64_t)val;
+            }
+            if (i % 64 == 0) {
+                uint8_t next_key[64];
+                cuda_sha512_64bytes(key, next_key);
+                #pragma unroll
+                for (int k = 0; k < 64; k++) key[k] = next_key[k];
+            }
+        }
+
+        // 2. initialDigest = sha512(seed + ":" + header)
+        char s_h[512];
+        for (int i = 0; i < seed_len; i++) s_h[i] = d_seed[i];
+        s_h[seed_len] = ':';
+        for (int i = 0; i < header_len; i++) s_h[seed_len + 1 + i] = header[i];
+        int sh_len = seed_len + 1 + header_len;
+
+        uint8_t initialDigest[64];
+        cuda_sha512((const uint8_t*)s_h, sh_len, initialDigest);
+
+        int64_t r[8];
+        double f[4];
+        for (int i = 0; i < 8; i++) {
+            uint64_t val = ((uint64_t)initialDigest[i * 8 + 0]) |
+                           (((uint64_t)initialDigest[i * 8 + 1]) << 8) |
+                           (((uint64_t)initialDigest[i * 8 + 2]) << 16) |
+                           (((uint64_t)initialDigest[i * 8 + 3]) << 24) |
+                           (((uint64_t)initialDigest[i * 8 + 4]) << 32) |
+                           (((uint64_t)initialDigest[i * 8 + 5]) << 40) |
+                           (((uint64_t)initialDigest[i * 8 + 6]) << 48) |
+                           (((uint64_t)initialDigest[i * 8 + 7]) << 56);
+            r[i] = (int64_t)val;
+        }
+        for (int i = 0; i < 4; i++) {
+            f[i] = (double)(r[i] % 1000000) / 1000.0;
+        }
+
+        // 3. VM Execution
+        const int mask = 4095;
+        for (int iter = 0; iter < 64; iter++) {
+            int opCode = (initialDigest[iter % 64] ^ (uint8_t)d_seed[iter % seed_len]) % 10;
+            int srcIdx = (iter + 1) % 8;
+            int dstIdx = iter % 8;
+            uint32_t u32 = (uint32_t)r[dstIdx];
+            int memIdx = (int)(u32 & mask);
+
+            switch (opCode) {
+                case 0: r[dstIdx] = r[dstIdx] + d_scratchpads[(size_t)memIdx * total_threads + tid]; break;
+                case 1: r[dstIdx] = r[dstIdx] - r[srcIdx]; break;
+                case 2: r[dstIdx] = r[dstIdx] * (r[srcIdx] | 1ULL); break;
+                case 3: r[dstIdx] = r[dstIdx] ^ r[srcIdx]; break;
+                case 4: {
+                    int shift = (int)(r[srcIdx] & 63);
+                    int64_t sr = r[dstIdx];
+                    int64_t right = (shift == 0) ? (sr < 0 ? -1 : 0) : (sr >> (64 - shift));
+                    uint64_t ur = ((uint64_t)sr << shift) | (uint64_t)right;
+                    r[dstIdx] = (int64_t)ur;
+                    break;
+                }
+                case 5: d_scratchpads[(size_t)memIdx * total_threads + tid] = r[dstIdx] ^ (int64_t)iter; break;
+                case 6: {
+                    f[dstIdx % 4] = f[dstIdx % 4] + f[srcIdx % 4];
+                    int64_t v = (int64_t)floor(abs(f[dstIdx % 4]));
+                    r[dstIdx] = r[dstIdx] ^ v;
+                    break;
+                }
+                case 7: {
+                    f[dstIdx % 4] = f[dstIdx % 4] * 1.00001;
+                    int64_t v = (int64_t)floor(abs(f[dstIdx % 4]));
+                    r[dstIdx] = r[dstIdx] ^ v;
+                    break;
+                }
+                case 8: {
+                    int nextMem = (memIdx + 64) & mask;
+                    int64_t temp = d_scratchpads[(size_t)memIdx * total_threads + tid];
+                    d_scratchpads[(size_t)memIdx * total_threads + tid] = d_scratchpads[(size_t)nextMem * total_threads + tid];
+                    d_scratchpads[(size_t)nextMem * total_threads + tid] = temp;
+                    break;
+                }
+                case 9: r[dstIdx] = -r[dstIdx]; break;
+            }
+        }
+
+        // 4. Final Sponge Digest
+        uint8_t finalBuf[64];
+        for (int i = 0; i < 8; i++) {
+            uint64_t val = (uint64_t)r[i];
+            finalBuf[i * 8 + 0] = (uint8_t)(val);
+            finalBuf[i * 8 + 1] = (uint8_t)(val >> 8);
+            finalBuf[i * 8 + 2] = (uint8_t)(val >> 16);
+            finalBuf[i * 8 + 3] = (uint8_t)(val >> 24);
+            finalBuf[i * 8 + 4] = (uint8_t)(val >> 32);
+            finalBuf[i * 8 + 5] = (uint8_t)(val >> 40);
+            finalBuf[i * 8 + 6] = (uint8_t)(val >> 48);
+            finalBuf[i * 8 + 7] = (uint8_t)(val >> 56);
+        }
+
+        uint8_t h1[32];
+        cuda_sha256_64bytes(finalBuf, h1);
+
+        int64_t sp_head[64];
+        for (int i = 0; i < 64; i++) {
+            sp_head[i] = d_scratchpads[(size_t)i * total_threads + tid];
+        }
+
+        uint8_t h2[32];
+        cuda_sha256_sponge(h1, sp_head, h2);
+
+        // Check difficulty
+        bool match = false;
+        if (target_u64 > 0) {
+            uint64_t h2_u64 = ((uint64_t)h2[0] << 56) | ((uint64_t)h2[1] << 48) |
+                              ((uint64_t)h2[2] << 40) | ((uint64_t)h2[3] << 32) |
+                              ((uint64_t)h2[4] << 24) | ((uint64_t)h2[5] << 16) |
+                              ((uint64_t)h2[6] << 8)  | ((uint64_t)h2[7]);
+            match = (h2_u64 <= target_u64);
+        } else {
+            match = true;
+            for (int k = 0; k < target_diff; k++) {
+                uint8_t nibble = (k % 2 == 0) ? (h2[k / 2] >> 4) : (h2[k / 2] & 0x0F);
+                if (nibble != 0) { match = false; break; }
+            }
+        }
+
+        if (match) {
+            int slot = atomicAdd(d_found_count, 1);
+            if (slot < MAX_SOLUTIONS) {
+                d_found_nonces[slot] = nonce;
+            }
+        }
+    }
+}
+
+// Single-hash test kernel
+__global__ void cortex_test_kernel(
+    const char* d_header, int header_len,
+    const char* d_seed, int seed_len,
+    int64_t* d_scratchpads,
+    uint8_t* d_out_hash
+) {
+    char header[512];
+    for (int i = 0; i < header_len; i++) header[i] = d_header[i];
+    header[header_len] = ':';
+    for (int i = 0; i < seed_len; i++) header[header_len + 1 + i] = d_seed[i];
+    int hs_len = header_len + 1 + seed_len;
+
+    uint8_t key[64];
+    cuda_sha512((const uint8_t*)header, hs_len, key);
+
+    for (int i = 0; i < 4096; i += 8) {
+        for (int j = 0; j < 8; j++) {
+            uint64_t val = ((uint64_t)key[j * 8 + 0]) |
+                           (((uint64_t)key[j * 8 + 1]) << 8) |
+                           (((uint64_t)key[j * 8 + 2]) << 16) |
+                           (((uint64_t)key[j * 8 + 3]) << 24) |
+                           (((uint64_t)key[j * 8 + 4]) << 32) |
+                           (((uint64_t)key[j * 8 + 5]) << 40) |
+                           (((uint64_t)key[j * 8 + 6]) << 48) |
+                           (((uint64_t)key[j * 8 + 7]) << 56);
+            d_scratchpads[i + j] = (int64_t)val;
+        }
+        if (i % 64 == 0) {
+            uint8_t next_key[64];
+            cuda_sha512_64bytes(key, next_key);
+            for (int k = 0; k < 64; k++) key[k] = next_key[k];
+        }
+    }
+
+    char s_h[512];
+    for (int i = 0; i < seed_len; i++) s_h[i] = d_seed[i];
+    s_h[seed_len] = ':';
+    for (int i = 0; i < header_len; i++) s_h[seed_len + 1 + i] = d_header[i];
+    int sh_len = seed_len + 1 + header_len;
+
+    uint8_t initialDigest[64];
+    cuda_sha512((const uint8_t*)s_h, sh_len, initialDigest);
+
+    int64_t r[8];
+    double f[4];
+    for (int i = 0; i < 8; i++) {
+        uint64_t val = ((uint64_t)initialDigest[i * 8 + 0]) |
+                       (((uint64_t)initialDigest[i * 8 + 1]) << 8) |
+                       (((uint64_t)initialDigest[i * 8 + 2]) << 16) |
+                       (((uint64_t)initialDigest[i * 8 + 3]) << 24) |
+                       (((uint64_t)initialDigest[i * 8 + 4]) << 32) |
+                       (((uint64_t)initialDigest[i * 8 + 5]) << 40) |
+                       (((uint64_t)initialDigest[i * 8 + 6]) << 48) |
+                       (((uint64_t)initialDigest[i * 8 + 7]) << 56);
+        r[i] = (int64_t)val;
+    }
+    for (int i = 0; i < 4; i++) {
+        f[i] = (double)(r[i] % 1000000) / 1000.0;
+    }
+
+    const int mask = 4095;
+    for (int iter = 0; iter < 64; iter++) {
+        int opCode = (initialDigest[iter % 64] ^ (uint8_t)d_seed[iter % seed_len]) % 10;
+        int srcIdx = (iter + 1) % 8;
+        int dstIdx = iter % 8;
+        uint32_t u32 = (uint32_t)r[dstIdx];
+        int memIdx = (int)(u32 & mask);
+
+        switch (opCode) {
+            case 0: r[dstIdx] = r[dstIdx] + d_scratchpads[memIdx]; break;
+            case 1: r[dstIdx] = r[dstIdx] - r[srcIdx]; break;
+            case 2: r[dstIdx] = r[dstIdx] * (r[srcIdx] | 1ULL); break;
+            case 3: r[dstIdx] = r[dstIdx] ^ r[srcIdx]; break;
+            case 4: {
+                int shift = (int)(r[srcIdx] & 63);
+                int64_t sr = r[dstIdx];
+                int64_t right = (shift == 0) ? (sr < 0 ? -1 : 0) : (sr >> (64 - shift));
+                uint64_t ur = ((uint64_t)sr << shift) | (uint64_t)right;
+                r[dstIdx] = (int64_t)ur;
+                break;
+            }
+            case 5: d_scratchpads[memIdx] = r[dstIdx] ^ (int64_t)iter; break;
+            case 6: {
+                f[dstIdx % 4] = f[dstIdx % 4] + f[srcIdx % 4];
+                int64_t v = (int64_t)floor(abs(f[dstIdx % 4]));
+                r[dstIdx] = r[dstIdx] ^ v;
+                break;
+            }
+            case 7: {
+                f[dstIdx % 4] = f[dstIdx % 4] * 1.00001;
+                int64_t v = (int64_t)floor(abs(f[dstIdx % 4]));
+                r[dstIdx] = r[dstIdx] ^ v;
+                break;
+            }
+            case 8: {
+                int nextMem = (memIdx + 64) & mask;
+                int64_t temp = d_scratchpads[memIdx];
+                d_scratchpads[memIdx] = d_scratchpads[nextMem];
+                d_scratchpads[nextMem] = temp;
+                break;
+            }
+            case 9: r[dstIdx] = -r[dstIdx]; break;
+        }
+    }
+
+    uint8_t finalBuf[64];
+    for (int i = 0; i < 8; i++) {
+        uint64_t val = (uint64_t)r[i];
+        finalBuf[i * 8 + 0] = (uint8_t)(val);
+        finalBuf[i * 8 + 1] = (uint8_t)(val >> 8);
+        finalBuf[i * 8 + 2] = (uint8_t)(val >> 16);
+        finalBuf[i * 8 + 3] = (uint8_t)(val >> 24);
+        finalBuf[i * 8 + 4] = (uint8_t)(val >> 32);
+        finalBuf[i * 8 + 5] = (uint8_t)(val >> 40);
+        finalBuf[i * 8 + 6] = (uint8_t)(val >> 48);
+        finalBuf[i * 8 + 7] = (uint8_t)(val >> 56);
+    }
+
+    uint8_t h1[32];
+    cuda_sha256_64bytes(finalBuf, h1);
+
+    int64_t sp_head[64];
+    for (int i = 0; i < 64; i++) sp_head[i] = d_scratchpads[i];
+
+    uint8_t h2[32];
+    cuda_sha256_sponge(h1, sp_head, h2);
+
+    for (int i = 0; i < 32; i++) d_out_hash[i] = h2[i];
+}
+
+struct CudaWorkerContext {
+    int device_id;
+    int total_threads;
+    int nonces_per_thread;
+    int blocks;
+    int threads_per_block;
+    cudaStream_t stream;
+
+    int64_t* d_scratchpads;
+    char* d_prefix;
+    char* d_suffix;
+    char* d_seed;
+    int* d_found_count;
+    uint64_t* d_found_nonces;
+
+    int last_prefix_len;
+    char last_prefix[512];
+    int last_suffix_len;
+    char last_suffix[512];
+    int last_seed_len;
+    char last_seed[256];
+};
+
+extern "C" {
+
+int cuda_bridge_get_device_count() {
+    int count = 0;
+    cudaError_t err = cudaGetDeviceCount(&count);
+    return (err == cudaSuccess) ? count : 0;
+}
+
+int cuda_bridge_get_device_info(int device_id, char* name_out, size_t name_len, size_t* total_mem, int* sm_count, int* major, int* minor) {
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device_id) != cudaSuccess) return -1;
+    if (name_out && name_len > 0) {
+        strncpy(name_out, prop.name, name_len - 1);
+        name_out[name_len - 1] = 0;
+    }
+    if (total_mem) *total_mem = prop.totalGlobalMem;
+    if (sm_count) *sm_count = prop.multiProcessorCount;
+    if (major) *major = prop.major;
+    if (minor) *minor = prop.minor;
+    return 0;
+}
+
+void* cuda_bridge_worker_create(int device_id, int total_threads, int nonces_per_thread) {
+    if (cudaSetDevice(device_id) != cudaSuccess) return NULL;
+
+    CudaWorkerContext* ctx = (CudaWorkerContext*)calloc(1, sizeof(CudaWorkerContext));
+    if (!ctx) return NULL;
+
+    ctx->device_id = device_id;
+    ctx->threads_per_block = 256;
+    ctx->blocks = (total_threads + ctx->threads_per_block - 1) / ctx->threads_per_block;
+    ctx->total_threads = ctx->blocks * ctx->threads_per_block;
+    ctx->nonces_per_thread = (nonces_per_thread > 0) ? nonces_per_thread : 4;
+
+    cudaStreamCreate(&ctx->stream);
+
+    // Coalesced scratchpad size: total_threads * 4096 * 8 bytes
+    size_t sp_size = (size_t)ctx->total_threads * 4096 * sizeof(int64_t);
+    cudaError_t err = cudaMalloc(&ctx->d_scratchpads, sp_size);
+    if (err != cudaSuccess) {
+        // Fallback to smaller thread count if VRAM is tight
+        ctx->total_threads = 24576;
+        ctx->blocks = ctx->total_threads / ctx->threads_per_block;
+        sp_size = (size_t)ctx->total_threads * 4096 * sizeof(int64_t);
+        if (cudaMalloc(&ctx->d_scratchpads, sp_size) != cudaSuccess) {
+            free(ctx);
+            return NULL;
+        }
+    }
+
+    cudaMalloc(&ctx->d_prefix, 512);
+    cudaMalloc(&ctx->d_suffix, 512);
+    cudaMalloc(&ctx->d_seed, 256);
+    cudaMalloc(&ctx->d_found_count, sizeof(int));
+    cudaMalloc(&ctx->d_found_nonces, MAX_SOLUTIONS * sizeof(uint64_t));
+
+    ctx->last_prefix_len = -1;
+    ctx->last_suffix_len = -1;
+    ctx->last_seed_len = -1;
+
+    return (void*)ctx;
+}
+
+void cuda_bridge_worker_destroy(void* handle) {
+    if (!handle) return;
+    CudaWorkerContext* ctx = (CudaWorkerContext*)handle;
+    cudaSetDevice(ctx->device_id);
+    if (ctx->stream) cudaStreamDestroy(ctx->stream);
+    if (ctx->d_scratchpads) cudaFree(ctx->d_scratchpads);
+    if (ctx->d_prefix) cudaFree(ctx->d_prefix);
+    if (ctx->d_suffix) cudaFree(ctx->d_suffix);
+    if (ctx->d_seed) cudaFree(ctx->d_seed);
+    if (ctx->d_found_count) cudaFree(ctx->d_found_count);
+    if (ctx->d_found_nonces) cudaFree(ctx->d_found_nonces);
+    free(ctx);
+}
+
+int cuda_bridge_worker_run_batch(
+    void* handle,
+    const char* prefix, int prefix_len,
+    const char* suffix, int suffix_len,
+    const char* seed, int seed_len,
+    uint64_t target_u64,
+    int target_diff,
+    uint64_t base_nonce,
+    uint64_t* found_nonces_out,
+    int max_found,
+    int* found_count_out,
+    uint64_t* hashes_done_out
+) {
+    if (!handle) return -1;
+    CudaWorkerContext* ctx = (CudaWorkerContext*)handle;
+    cudaSetDevice(ctx->device_id);
+
+    // Update prefix / suffix / seed on device if changed
+    if (prefix_len != ctx->last_prefix_len || memcmp(prefix, ctx->last_prefix, prefix_len) != 0) {
+        cudaMemcpyAsync(ctx->d_prefix, prefix, prefix_len, cudaMemcpyHostToDevice, ctx->stream);
+        ctx->last_prefix_len = prefix_len;
+        memcpy(ctx->last_prefix, prefix, prefix_len);
+    }
+    if (suffix_len != ctx->last_suffix_len || memcmp(suffix, ctx->last_suffix, suffix_len) != 0) {
+        cudaMemcpyAsync(ctx->d_suffix, suffix, suffix_len, cudaMemcpyHostToDevice, ctx->stream);
+        ctx->last_suffix_len = suffix_len;
+        memcpy(ctx->last_suffix, suffix, suffix_len);
+    }
+    if (seed_len != ctx->last_seed_len || memcmp(seed, ctx->last_seed, seed_len) != 0) {
+        cudaMemcpyAsync(ctx->d_seed, seed, seed_len, cudaMemcpyHostToDevice, ctx->stream);
+        ctx->last_seed_len = seed_len;
+        memcpy(ctx->last_seed, seed, seed_len);
+    }
+
+    // Reset found count
+    cudaMemsetAsync(ctx->d_found_count, 0, sizeof(int), ctx->stream);
+
+    // Launch mining kernel
+    cortex_mine_kernel<<<ctx->blocks, ctx->threads_per_block, 0, ctx->stream>>>(
+        ctx->d_prefix, prefix_len,
+        ctx->d_suffix, suffix_len,
+        ctx->d_seed, seed_len,
+        target_diff,
+        target_u64,
+        base_nonce,
+        ctx->nonces_per_thread,
+        ctx->d_scratchpads,
+        ctx->d_found_count,
+        ctx->d_found_nonces
+    );
+
+    int h_found_count = 0;
+    cudaMemcpyAsync(&h_found_count, ctx->d_found_count, sizeof(int), cudaMemcpyDeviceToHost, ctx->stream);
+    cudaStreamSynchronize(ctx->stream);
+
+    if (h_found_count > 0 && found_nonces_out && max_found > 0) {
+        int copy_count = (h_found_count > max_found) ? max_found : h_found_count;
+        cudaMemcpy(found_nonces_out, ctx->d_found_nonces, copy_count * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+        *found_count_out = copy_count;
+    } else {
+        *found_count_out = 0;
+    }
+
+    if (hashes_done_out) {
+        *hashes_done_out = (uint64_t)ctx->total_threads * (uint64_t)ctx->nonces_per_thread;
+    }
+    return 0;
+}
+
+int cuda_bridge_self_test(int device_id) {
+    if (cudaSetDevice(device_id) != cudaSuccess) return 0;
+
+    int64_t* d_sp;
+    uint8_t* d_hash;
+    char* d_hdr;
+    char* d_seed;
+
+    if (cudaMalloc(&d_sp, 4096 * sizeof(int64_t)) != cudaSuccess) return 0;
+    cudaMalloc(&d_hash, 32);
+    cudaMalloc(&d_hdr, 256);
+    cudaMalloc(&d_seed, 256);
+
+    const char* seed = "cortex-randomx-genesis-seed-v1";
+    int seed_len = strlen(seed);
+    cudaMemcpy(d_seed, seed, seed_len, cudaMemcpyHostToDevice);
+
+    // Test Vector 123
+    const char* hdr123 = "test_header_123";
+    int h123_len = strlen(hdr123);
+    cudaMemcpy(d_hdr, hdr123, h123_len, cudaMemcpyHostToDevice);
+
+    cortex_test_kernel<<<1, 1>>>(d_hdr, h123_len, d_seed, seed_len, d_sp, d_hash);
+    cudaDeviceSynchronize();
+
+    uint8_t res123[32];
+    cudaMemcpy(res123, d_hash, 32, cudaMemcpyDeviceToHost);
+
+    const uint8_t exp123[32] = {
+        0xb1, 0xb9, 0x59, 0x9c, 0x0a, 0x73, 0xa8, 0x4c,
+        0x57, 0x77, 0x36, 0x9c, 0x3a, 0x2a, 0xf5, 0x0e,
+        0x78, 0xcc, 0x63, 0xb6, 0xe0, 0xc2, 0x2c, 0x30,
+        0xf1, 0x91, 0xc9, 0x8f, 0xc0, 0x63, 0x16, 0xa5
+    };
+    if (memcmp(res123, exp123, 32) != 0) {
+        cudaFree(d_sp); cudaFree(d_hash); cudaFree(d_hdr); cudaFree(d_seed);
+        return 0;
+    }
+
+    // Test Vector 99999
+    const char* hdr99k = "test_header_99999";
+    int h99k_len = strlen(hdr99k);
+    cudaMemcpy(d_hdr, hdr99k, h99k_len, cudaMemcpyHostToDevice);
+
+    cortex_test_kernel<<<1, 1>>>(d_hdr, h99k_len, d_seed, seed_len, d_sp, d_hash);
+    cudaDeviceSynchronize();
+
+    uint8_t res99k[32];
+    cudaMemcpy(res99k, d_hash, 32, cudaMemcpyDeviceToHost);
+
+    const uint8_t exp99k[32] = {
+        0x91, 0x2f, 0x8c, 0xb7, 0xed, 0x73, 0x77, 0x36,
+        0x58, 0xaf, 0x2f, 0x42, 0x12, 0xaa, 0x40, 0xbb,
+        0x36, 0x5d, 0x1a, 0x5a, 0x20, 0x8e, 0xb0, 0x9c,
+        0xd6, 0x6e, 0x56, 0x7b, 0x3c, 0xf7, 0x0a, 0x5c
+    };
+
+    cudaFree(d_sp); cudaFree(d_hash); cudaFree(d_hdr); cudaFree(d_seed);
+    return (memcmp(res99k, exp99k, 32) == 0) ? 1 : 0;
+}
+
+}
