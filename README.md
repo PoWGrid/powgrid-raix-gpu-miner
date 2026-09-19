@@ -28,14 +28,16 @@ High-performance, dual-backend GPU mining software for **Reticulum AI ($RAIX)** 
 
 ## 📥 Precompiled Binaries (Ready to Run)
 
-No CUDA/OpenCL SDK setup or compilation required — download the prebuilt release for your mining rig:
+No CUDA/OpenCL SDK setup or compilation required — download official precompiled packages directly from [GitHub Releases](https://github.com/PoWGrid/powgrid-raix-gpu-miner/releases):
 
 | Platform | Target | Download Link | Quick Launch |
 | :--- | :--- | :--- | :--- |
-| **Windows** | x86_64 (NVIDIA / AMD / Intel) | [📥 powgrid-raix-gpu-miner-windows-x64.zip](https://raix.powgrid.xyz/downloads/powgrid-raix-gpu-miner-windows-x64.zip) | Double-click `start_mining.bat` |
-| **Linux** | x86_64 (Ubuntu / Debian / RHEL) | [📥 powgrid-raix-gpu-miner-linux-x64.tar.gz](https://raix.powgrid.xyz/downloads/powgrid-raix-gpu-miner-linux-x64.tar.gz) | `./powgrid-raix-gpu-miner` |
-| **HiveOS** | Custom Miner Package | [📥 powgrid-raix-gpu-miner-hiveos.tar.gz](https://raix.powgrid.xyz/downloads/powgrid-raix-gpu-miner-hiveos.tar.gz) | HiveOS Custom URL installation |
-| **macOS** | Metal / OpenCL (Apple Silicon & Intel) | [📥 powgrid-raix-miner-macos.zip](https://raix.powgrid.xyz/downloads/powgrid-raix-miner-macos.zip) | `./powgrid-raix-miner` |
+| **Windows** | x86_64 (NVIDIA / AMD / Intel) | [📥 powgrid-raix-gpu-miner-windows-x64.zip](https://github.com/PoWGrid/powgrid-raix-gpu-miner/releases/latest/download/powgrid-raix-gpu-miner-windows-x64.zip) | Double-click `start_mining.bat` |
+| **Linux** | x86_64 (Ubuntu / Debian / RHEL) | [📥 powgrid-raix-gpu-miner-linux-x64.tar.gz](https://github.com/PoWGrid/powgrid-raix-gpu-miner/releases/latest/download/powgrid-raix-gpu-miner-linux-x64.tar.gz) | `./powgrid-raix-gpu-miner` |
+| **HiveOS** | Custom Miner Package | [📥 powgrid-raix-gpu-miner-hiveos.tar.gz](https://github.com/PoWGrid/powgrid-raix-gpu-miner/releases/latest/download/powgrid-raix-gpu-miner-hiveos.tar.gz) | HiveOS Custom URL installation |
+| **macOS** | Metal / OpenCL (Apple Silicon & Intel) | [📥 powgrid-raix-miner-macos.zip](https://github.com/PoWGrid/powgrid-raix-gpu-miner/releases/latest/download/powgrid-raix-miner-macos.zip) | `./powgrid-raix-miner` |
+
+> 🔗 You can also find individual `.exe` files, checksums, and previous versions on the **[Releases Page](https://github.com/PoWGrid/powgrid-raix-gpu-miner/releases)**.
 
 ---
 
