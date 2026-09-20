@@ -1,6 +1,6 @@
 [package]
 name = "powgrid-raix-gpu-miner"
-version = "1.1.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["PowGrid Community Developers"]
 description = "High-performance dual-engine (CUDA + OpenCL) RandomX GPU miner for Reticulum AI ($RAIX)"

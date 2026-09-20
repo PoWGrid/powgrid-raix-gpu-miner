@@ -335,7 +335,7 @@ fn main() {
     }
 
     println!("===========================================================");
-    println!("  ⚡ PowGrid Reticulum AI ($RAIX) Unified GPU Miner v1.1");
+    println!("  ⚡ PowGrid Reticulum AI ($RAIX) Unified GPU Miner v2.1");
     println!("  Architecture        : Dual-Engine [Native CUDA + OpenCL JIT]");
     println!("  Target Hardware     : Any GPU (NVIDIA, AMD, Intel, Apple)");
     println!("===========================================================\n");
@@ -698,7 +698,7 @@ fn main() {
                 let border_bot = format!("╰{}╯\x1b[K\n", "─".repeat(76));
 
                 buf.push_str(&border_top);
-                buf.push_str(&box_row("\x1b[1;36m► POWGRID RETICULUM AI ($RAIX) HIGH-PERFORMANCE GPU MINER v1.1\x1b[0m", 74));
+                buf.push_str(&box_row("\x1b[1;36m► POWGRID RETICULUM AI ($RAIX) HIGH-PERFORMANCE GPU MINER v2.1\x1b[0m", 74));
                 buf.push_str(&two_col_row(
                     &format!("\x1b[90mPool:\x1b[0m \x1b[1;37m{}\x1b[0m", pool_display),
                     41,

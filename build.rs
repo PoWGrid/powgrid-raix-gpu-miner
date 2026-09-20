@@ -8,6 +8,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda_bridge/cortex_cuda_bridge.h");
     println!("cargo:rerun-if-changed=cuda_bridge/k256.cuh");
     println!("cargo:rerun-if-changed=cuda_bridge/k512.cuh");
+    println!("cargo:rerun-if-changed=cuda_bridge/aes256.cuh");
     println!("cargo:rerun-if-changed=src/opencl_kernel.cl");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -58,9 +59,8 @@ fn main() {
 
         println!("cargo:rustc-link-search=native={}", out_dir.display());
         println!("cargo:rustc-link-lib=static=cortex_cuda");
-        println!("cargo:rustc-link-lib=cudart");
-        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
         println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
+        println!("cargo:rustc-link-lib=cudart");
     } else {
         println!("cargo:warning=nvcc compiler not found. Compiling with universal OpenCL backend.");
     }

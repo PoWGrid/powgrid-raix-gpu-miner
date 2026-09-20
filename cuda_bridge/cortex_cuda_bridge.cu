@@ -8,6 +8,7 @@
 
 #include "k256.cuh"
 #include "k512.cuh"
+#include "aes256.cuh"
 
 #define ROTR64(x, n) (((x) >> (n)) | ((x) << (64 - (n))))
 #define CH64(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
@@ -210,6 +211,97 @@ __device__ void cuda_sha256_sponge(const uint8_t h1[32], const int64_t* scratchp
     }
 }
 
+__device__ void cuda_sha256(const uint8_t* data, int len, uint8_t digest[32]) {
+    uint32_t state[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    uint8_t block[64];
+    int offset = 0;
+    while (offset + 64 <= len) {
+        sha256_transform(state, data + offset);
+        offset += 64;
+    }
+    int rem = len - offset;
+    for (int i = 0; i < rem; i++) block[i] = data[offset + i];
+    block[rem] = 0x80;
+    if (rem < 56) {
+        for (int i = rem + 1; i < 56; i++) block[i] = 0;
+    } else {
+        for (int i = rem + 1; i < 64; i++) block[i] = 0;
+        sha256_transform(state, block);
+        for (int i = 0; i < 56; i++) block[i] = 0;
+    }
+    uint64_t bits = (uint64_t)len * 8;
+    for (int i = 0; i < 8; i++) block[56 + i] = (uint8_t)(bits >> ((7 - i) * 8));
+    sha256_transform(state, block);
+
+    for (int i = 0; i < 8; i++) {
+        digest[i * 4 + 0] = (uint8_t)(state[i] >> 24);
+        digest[i * 4 + 1] = (uint8_t)(state[i] >> 16);
+        digest[i * 4 + 2] = (uint8_t)(state[i] >> 8);
+        digest[i * 4 + 3] = (uint8_t)(state[i]);
+    }
+}
+
+__device__ __forceinline__ uint32_t cuda_bswap32(uint32_t x) {
+    return __byte_perm(x, 0, 0x0123);
+}
+
+__device__ __forceinline__ int64_t v2_get_word(
+    uint32_t idx,
+    const uint32_t rk[15][4],
+    const int64_t spongeHead[64],
+    const uint32_t writeCacheAddr[48],
+    const int64_t writeCacheVal[48],
+    uint32_t writeCacheCount
+) {
+    for (uint32_t c = 0; c < writeCacheCount; c++) {
+        if (writeCacheAddr[c] == idx) return writeCacheVal[c];
+    }
+    if (idx < 64) return spongeHead[idx];
+
+    uint32_t blockIdx = idx >> 1;
+    uint32_t in_blk[4] = { 0, 0, 0, blockIdx };
+    uint32_t ct[4];
+    aes256_encrypt_block(rk, in_blk, ct);
+
+    if ((idx & 1) == 0) {
+        uint32_t lo = cuda_bswap32(ct[0]);
+        uint32_t hi = cuda_bswap32(ct[1]);
+        return (int64_t)(((uint64_t)hi << 32) | (uint64_t)lo);
+    } else {
+        uint32_t lo = cuda_bswap32(ct[2]);
+        uint32_t hi = cuda_bswap32(ct[3]);
+        return (int64_t)(((uint64_t)hi << 32) | (uint64_t)lo);
+    }
+}
+
+__device__ __forceinline__ void v2_set_word(
+    uint32_t idx,
+    int64_t val,
+    int64_t spongeHead[64],
+    uint32_t writeCacheAddr[48],
+    int64_t writeCacheVal[48],
+    uint32_t* writeCacheCount
+) {
+    for (uint32_t c = 0; c < *writeCacheCount; c++) {
+        if (writeCacheAddr[c] == idx) {
+            writeCacheVal[c] = val;
+            if (idx < 64) spongeHead[idx] = val;
+            return;
+        }
+    }
+    if (*writeCacheCount < 48) {
+        writeCacheAddr[*writeCacheCount] = idx;
+        writeCacheVal[*writeCacheCount] = val;
+        (*writeCacheCount)++;
+    }
+    if (idx < 64) {
+        spongeHead[idx] = val;
+    }
+}
+
 __device__ int u64_to_str(uint64_t val, char* out) {
     if (val == 0) {
         out[0] = '0';
@@ -408,6 +500,180 @@ __global__ void cortex_mine_kernel(
     }
 }
 
+__global__ void cortex_mine_v2_kernel(
+    const char* d_prefix, int prefix_len,
+    const char* d_suffix, int suffix_len,
+    const char* d_seed, int seed_len,
+    int target_diff,
+    uint64_t target_u64,
+    uint64_t base_nonce,
+    int nonces_per_thread,
+    int* d_found_count,
+    uint64_t* d_found_nonces
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t thread_base = base_nonce + (uint64_t)tid * (uint64_t)nonces_per_thread;
+
+    for (int n = 0; n < nonces_per_thread; n++) {
+        if (*d_found_count > 0) return;
+
+        uint64_t nonce = thread_base + (uint64_t)n;
+
+        char header[512];
+        for (int i = 0; i < prefix_len; i++) header[i] = d_prefix[i];
+        int nonce_len = u64_to_str(nonce, header + prefix_len);
+        int cur_len = prefix_len + nonce_len;
+        for (int i = 0; i < suffix_len; i++) header[cur_len + i] = d_suffix[i];
+        int header_len = cur_len + suffix_len;
+
+        // 1. seed_key = sha256(header + ":" + seed)
+        uint8_t hs_buf[512];
+        for (int i = 0; i < header_len; i++) hs_buf[i] = (uint8_t)header[i];
+        hs_buf[header_len] = ':';
+        for (int i = 0; i < seed_len; i++) hs_buf[header_len + 1 + i] = (uint8_t)d_seed[i];
+        int hs_len = header_len + 1 + seed_len;
+
+        uint8_t seed_key[32];
+        cuda_sha256(hs_buf, hs_len, seed_key);
+
+        // 2. initial_digest = sha512(seed + ":" + header)
+        uint8_t sh_buf[512];
+        for (int i = 0; i < seed_len; i++) sh_buf[i] = (uint8_t)d_seed[i];
+        sh_buf[seed_len] = ':';
+        for (int i = 0; i < header_len; i++) sh_buf[seed_len + 1 + i] = (uint8_t)header[i];
+        int sh_len = seed_len + 1 + header_len;
+
+        uint8_t initial_digest[64];
+        cuda_sha512(sh_buf, sh_len, initial_digest);
+
+        // 3. Initialize registers
+        int64_t r[8];
+        for (int i = 0; i < 8; i++) {
+            uint64_t val = 0;
+            for (int b = 0; b < 8; b++) {
+                val |= ((uint64_t)initial_digest[i * 8 + b]) << (b * 8);
+            }
+            r[i] = (int64_t)val;
+        }
+
+        double f[4];
+        for (int i = 0; i < 4; i++) {
+            f[i] = (double)(r[i] % 1000000) / 1000.0;
+        }
+
+        // Expand AES-256 round keys
+        uint32_t rk[15][4];
+        aes256_key_expansion(seed_key, rk);
+
+        // Generate first 64 words (512 bytes) of keystream
+        int64_t spongeHead[64];
+        for (int blk = 0; blk < 32; blk++) {
+            uint32_t in_blk[4] = { 0, 0, 0, (uint32_t)blk };
+            uint32_t ct[4];
+            aes256_encrypt_block(rk, in_blk, ct);
+
+            uint32_t lo0 = cuda_bswap32(ct[0]);
+            uint32_t hi0 = cuda_bswap32(ct[1]);
+            spongeHead[blk * 2] = (int64_t)(((uint64_t)hi0 << 32) | (uint64_t)lo0);
+
+            uint32_t lo1 = cuda_bswap32(ct[2]);
+            uint32_t hi1 = cuda_bswap32(ct[3]);
+            spongeHead[blk * 2 + 1] = (int64_t)(((uint64_t)hi1 << 32) | (uint64_t)lo1);
+        }
+
+        // Sparse Write Cache
+        uint32_t writeCacheAddr[48];
+        int64_t writeCacheVal[48];
+        uint32_t writeCacheCount = 0;
+
+        #define getWordV2(idx) v2_get_word((idx), rk, spongeHead, writeCacheAddr, writeCacheVal, writeCacheCount)
+        #define setWordV2(idx, val) v2_set_word((idx), (val), spongeHead, writeCacheAddr, writeCacheVal, &writeCacheCount)
+
+        // 128-cycle RandomX VM loop
+        const uint32_t mask = 262143;
+        for (int iter = 0; iter < 128; iter++) {
+            uint8_t opCode = (initial_digest[iter % 64] ^ (uint8_t)d_seed[iter % seed_len]) % 10;
+            int src = (iter + 1) & 7;
+            int dst = iter & 7;
+            uint32_t memIdx = ((uint32_t)r[dst]) & mask;
+
+            switch (opCode) {
+                case 0: r[dst] = r[dst] + getWordV2(memIdx); break;
+                case 1: r[dst] = r[dst] - r[src]; break;
+                case 2: r[dst] = r[dst] * (r[src] | 1ULL); break;
+                case 3: r[dst] ^= r[src]; break;
+                case 4: {
+                    uint32_t shift = (uint32_t)r[src] & 63;
+                    int64_t sr = r[dst];
+                    int64_t right = (shift == 0) ? ((sr < 0) ? -1LL : 0LL) : (sr >> (64 - shift));
+                    r[dst] = (int64_t)(((uint64_t)sr << shift) | (uint64_t)right);
+                    break;
+                }
+                case 5: setWordV2(memIdx, r[dst] ^ (int64_t)iter); break;
+                case 6: {
+                    f[dst % 4] += f[src % 4];
+                    r[dst] ^= (int64_t)floor(fabs(f[dst % 4]));
+                    break;
+                }
+                case 7: {
+                    f[dst % 4] *= 1.00001;
+                    r[dst] ^= (int64_t)floor(fabs(f[dst % 4]));
+                    break;
+                }
+                case 8: {
+                    uint32_t nextMem = (memIdx + 64) & mask;
+                    int64_t tmp = getWordV2(memIdx);
+                    int64_t tmp2 = getWordV2(nextMem);
+                    setWordV2(memIdx, tmp2);
+                    setWordV2(nextMem, tmp);
+                    break;
+                }
+                case 9: r[dst] = -r[dst]; break;
+            }
+        }
+        #undef getWordV2
+        #undef setWordV2
+
+        // Step 4 Final Sponge Digest
+        uint8_t finalBuf[64];
+        for (int i = 0; i < 8; i++) {
+            uint64_t val = (uint64_t)r[i];
+            for (int b = 0; b < 8; b++) {
+                finalBuf[i * 8 + b] = (uint8_t)(val >> (b * 8));
+            }
+        }
+
+        uint8_t h1[32];
+        cuda_sha256_64bytes(finalBuf, h1);
+
+        uint8_t h2[32];
+        cuda_sha256_sponge(h1, spongeHead, h2);
+
+        // Check target difficulty
+        bool match = false;
+        if (target_u64 > 0) {
+            uint64_t h2_u64 = ((uint64_t)h2[0] << 56) | ((uint64_t)h2[1] << 48) |
+                              ((uint64_t)h2[2] << 40) | ((uint64_t)h2[3] << 32) |
+                              ((uint64_t)h2[4] << 24) | ((uint64_t)h2[5] << 16) |
+                              ((uint64_t)h2[6] << 8)  | ((uint64_t)h2[7]);
+            match = (h2_u64 <= target_u64);
+        } else {
+            match = true;
+            for (int k = 0; k < target_diff; k++) {
+                uint8_t nibble = (k % 2 == 0) ? (h2[k / 2] >> 4) : (h2[k / 2] & 0x0F);
+                if (nibble != 0) { match = false; break; }
+            }
+        }
+
+        if (match) {
+            int slot = atomicAdd(d_found_count, 1);
+            if (slot < MAX_SOLUTIONS) {
+                d_found_nonces[slot] = nonce;
+            }
+        }
+    }
+}
+
 // Single-hash test kernel
 __global__ void cortex_test_kernel(
     const char* d_header, int header_len,
@@ -537,6 +803,134 @@ __global__ void cortex_test_kernel(
     cuda_sha256_sponge(h1, sp_head, h2);
 
     for (int i = 0; i < 32; i++) d_out_hash[i] = h2[i];
+}
+
+__global__ void cortex_test_v2_kernel(
+    const char* d_header, int header_len,
+    const char* d_seed, int seed_len,
+    uint8_t* d_out_hash
+) {
+    // 1. seed_key = sha256(header + ":" + seed)
+    uint8_t hs_buf[512];
+    for (int i = 0; i < header_len; i++) hs_buf[i] = (uint8_t)d_header[i];
+    hs_buf[header_len] = ':';
+    for (int i = 0; i < seed_len; i++) hs_buf[header_len + 1 + i] = (uint8_t)d_seed[i];
+    int hs_len = header_len + 1 + seed_len;
+
+    uint8_t seed_key[32];
+    cuda_sha256(hs_buf, hs_len, seed_key);
+
+    // 2. initial_digest = sha512(seed + ":" + header)
+    uint8_t sh_buf[512];
+    for (int i = 0; i < seed_len; i++) sh_buf[i] = (uint8_t)d_seed[i];
+    sh_buf[seed_len] = ':';
+    for (int i = 0; i < header_len; i++) sh_buf[seed_len + 1 + i] = (uint8_t)d_header[i];
+    int sh_len = seed_len + 1 + header_len;
+
+    uint8_t initial_digest[64];
+    cuda_sha512(sh_buf, sh_len, initial_digest);
+
+    // 3. Initialize registers
+    int64_t r[8];
+    for (int i = 0; i < 8; i++) {
+        uint64_t val = 0;
+        for (int b = 0; b < 8; b++) {
+            val |= ((uint64_t)initial_digest[i * 8 + b]) << (b * 8);
+        }
+        r[i] = (int64_t)val;
+    }
+
+    double f[4];
+    for (int i = 0; i < 4; i++) {
+        f[i] = (double)(r[i] % 1000000) / 1000.0;
+    }
+
+    // Expand AES-256 round keys
+    uint32_t rk[15][4];
+    aes256_key_expansion(seed_key, rk);
+
+    // Generate first 64 words (512 bytes) of keystream
+    int64_t spongeHead[64];
+    for (int blk = 0; blk < 32; blk++) {
+        uint32_t in_blk[4] = { 0, 0, 0, (uint32_t)blk };
+        uint32_t ct[4];
+        aes256_encrypt_block(rk, in_blk, ct);
+
+        uint32_t lo0 = cuda_bswap32(ct[0]);
+        uint32_t hi0 = cuda_bswap32(ct[1]);
+        spongeHead[blk * 2] = (int64_t)(((uint64_t)hi0 << 32) | (uint64_t)lo0);
+
+        uint32_t lo1 = cuda_bswap32(ct[2]);
+        uint32_t hi1 = cuda_bswap32(ct[3]);
+        spongeHead[blk * 2 + 1] = (int64_t)(((uint64_t)hi1 << 32) | (uint64_t)lo1);
+    }
+
+    // Sparse Write Cache
+    uint32_t writeCacheAddr[48];
+    int64_t writeCacheVal[48];
+    uint32_t writeCacheCount = 0;
+
+    #define getWordV2(idx) v2_get_word((idx), rk, spongeHead, writeCacheAddr, writeCacheVal, writeCacheCount)
+    #define setWordV2(idx, val) v2_set_word((idx), (val), spongeHead, writeCacheAddr, writeCacheVal, &writeCacheCount)
+
+    // 128-cycle RandomX VM loop
+    const uint32_t mask = 262143;
+    for (int iter = 0; iter < 128; iter++) {
+        uint8_t opCode = (initial_digest[iter % 64] ^ (uint8_t)d_seed[iter % seed_len]) % 10;
+        int src = (iter + 1) & 7;
+        int dst = iter & 7;
+        uint32_t memIdx = ((uint32_t)r[dst]) & mask;
+
+        switch (opCode) {
+            case 0: r[dst] = r[dst] + getWordV2(memIdx); break;
+            case 1: r[dst] = r[dst] - r[src]; break;
+            case 2: r[dst] = r[dst] * (r[src] | 1ULL); break;
+            case 3: r[dst] ^= r[src]; break;
+            case 4: {
+                uint32_t shift = (uint32_t)r[src] & 63;
+                int64_t sr = r[dst];
+                int64_t right = (shift == 0) ? ((sr < 0) ? -1LL : 0LL) : (sr >> (64 - shift));
+                r[dst] = (int64_t)(((uint64_t)sr << shift) | (uint64_t)right);
+                break;
+            }
+            case 5: setWordV2(memIdx, r[dst] ^ (int64_t)iter); break;
+            case 6: {
+                f[dst % 4] += f[src % 4];
+                r[dst] ^= (int64_t)floor(fabs(f[dst % 4]));
+                break;
+            }
+            case 7: {
+                f[dst % 4] *= 1.00001;
+                r[dst] ^= (int64_t)floor(fabs(f[dst % 4]));
+                break;
+            }
+            case 8: {
+                uint32_t nextMem = (memIdx + 64) & mask;
+                int64_t tmp = getWordV2(memIdx);
+                int64_t tmp2 = getWordV2(nextMem);
+                setWordV2(memIdx, tmp2);
+                setWordV2(nextMem, tmp);
+                break;
+            }
+            case 9: r[dst] = -r[dst]; break;
+        }
+    }
+    #undef getWordV2
+    #undef setWordV2
+
+    // Step 4 Final Sponge Digest
+    uint8_t finalBuf[64];
+    for (int i = 0; i < 8; i++) {
+        uint64_t val = (uint64_t)r[i];
+        for (int b = 0; b < 8; b++) {
+            finalBuf[i * 8 + b] = (uint8_t)(val >> (b * 8));
+        }
+    }
+
+    uint8_t h1[32];
+    cuda_sha256_64bytes(finalBuf, h1);
+
+    cuda_sha256_sponge(h1, spongeHead, d_out_hash);
 }
 
 struct CudaWorkerContext {
@@ -677,18 +1071,34 @@ int cuda_bridge_worker_run_batch(
     cudaMemsetAsync(ctx->d_found_count, 0, sizeof(int), ctx->stream);
 
     // Launch mining kernel
-    cortex_mine_kernel<<<ctx->blocks, ctx->threads_per_block, 0, ctx->stream>>>(
-        ctx->d_prefix, prefix_len,
-        ctx->d_suffix, suffix_len,
-        ctx->d_seed, seed_len,
-        target_diff,
-        target_u64,
-        base_nonce,
-        ctx->nonces_per_thread,
-        ctx->d_scratchpads,
-        ctx->d_found_count,
-        ctx->d_found_nonces
-    );
+    bool is_v2 = (seed && (strstr(seed, "v2") != NULL || strstr(seed, "reticulum-randomx-v2") != NULL));
+
+    if (is_v2) {
+        cortex_mine_v2_kernel<<<ctx->blocks, ctx->threads_per_block, 0, ctx->stream>>>(
+            ctx->d_prefix, prefix_len,
+            ctx->d_suffix, suffix_len,
+            ctx->d_seed, seed_len,
+            target_diff,
+            target_u64,
+            base_nonce,
+            ctx->nonces_per_thread,
+            ctx->d_found_count,
+            ctx->d_found_nonces
+        );
+    } else {
+        cortex_mine_kernel<<<ctx->blocks, ctx->threads_per_block, 0, ctx->stream>>>(
+            ctx->d_prefix, prefix_len,
+            ctx->d_suffix, suffix_len,
+            ctx->d_seed, seed_len,
+            target_diff,
+            target_u64,
+            base_nonce,
+            ctx->nonces_per_thread,
+            ctx->d_scratchpads,
+            ctx->d_found_count,
+            ctx->d_found_nonces
+        );
+    }
 
     int h_found_count = 0;
     cudaMemcpyAsync(&h_found_count, ctx->d_found_count, sizeof(int), cudaMemcpyDeviceToHost, ctx->stream);
@@ -764,9 +1174,32 @@ int cuda_bridge_self_test(int device_id) {
         0x36, 0x5d, 0x1a, 0x5a, 0x20, 0x8e, 0xb0, 0x9c,
         0xd6, 0x6e, 0x56, 0x7b, 0x3c, 0xf7, 0x0a, 0x5c
     };
+    if (memcmp(res99k, exp99k, 32) != 0) {
+        cudaFree(d_sp); cudaFree(d_hash); cudaFree(d_hdr); cudaFree(d_seed);
+        return 0;
+    }
+
+    // Test Vector v2.1 Hard Fork
+    const char* seed_v2 = "reticulum-randomx-v2-epoch-17";
+    int s_v2_len = strlen(seed_v2);
+    cudaMemcpy(d_seed, seed_v2, s_v2_len, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_hdr, hdr123, h123_len, cudaMemcpyHostToDevice);
+
+    cortex_test_v2_kernel<<<1, 1>>>(d_hdr, h123_len, d_seed, s_v2_len, d_hash);
+    cudaDeviceSynchronize();
+
+    uint8_t res_v2[32];
+    cudaMemcpy(res_v2, d_hash, 32, cudaMemcpyDeviceToHost);
+
+    const uint8_t exp_v2[32] = {
+        0x4a, 0x26, 0xd0, 0x92, 0xa4, 0x83, 0x60, 0x7d,
+        0xa8, 0x18, 0xf9, 0xe2, 0x76, 0xdb, 0x2c, 0x5d,
+        0x96, 0x24, 0xe8, 0x9d, 0xab, 0x9b, 0xe5, 0x46,
+        0x2b, 0x79, 0x68, 0x07, 0x9e, 0x6b, 0xf2, 0x2f
+    };
 
     cudaFree(d_sp); cudaFree(d_hash); cudaFree(d_hdr); cudaFree(d_seed);
-    return (memcmp(res99k, exp99k, 32) == 0) ? 1 : 0;
+    return (memcmp(res_v2, exp_v2, 32) == 0) ? 1 : 0;
 }
 
 }
