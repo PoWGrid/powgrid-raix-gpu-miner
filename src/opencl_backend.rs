@@ -80,13 +80,31 @@ pub fn get_opencl_lib() -> Option<&'static OpenClLib> {
 
         for &name in &lib_names {
             let c_name = CString::new(name).unwrap();
+            #[cfg(target_os = "windows")]
+            let handle = unsafe {
+                extern "system" {
+                    fn LoadLibraryA(lpLibFileName: *const libc::c_char) -> *mut c_void;
+                }
+                LoadLibraryA(c_name.as_ptr())
+            };
+            #[cfg(not(target_os = "windows"))]
             let handle = unsafe { libc::dlopen(c_name.as_ptr(), libc::RTLD_NOW) };
+
             if !handle.is_null() {
                 unsafe {
                     macro_rules! load_sym {
                         ($sym:ident, $type:ty) => {{
                             let s_name = CString::new(stringify!($sym)).unwrap();
+                            #[cfg(target_os = "windows")]
+                            let p = {
+                                extern "system" {
+                                    fn GetProcAddress(hModule: *mut c_void, lpProcName: *const libc::c_char) -> *mut c_void;
+                                }
+                                GetProcAddress(handle, s_name.as_ptr())
+                            };
+                            #[cfg(not(target_os = "windows"))]
                             let p = libc::dlsym(handle, s_name.as_ptr());
+
                             if p.is_null() {
                                 return None;
                             }
