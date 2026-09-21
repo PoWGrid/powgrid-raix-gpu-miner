@@ -18,7 +18,7 @@ fn main() {
     // Check if nvcc is available
     let nvcc_check = Command::new("nvcc").arg("--version").output();
     let has_nvcc = match nvcc_check {
-        Ok(out) => out.status.success(),
+        Ok(out) => out.status.success() && (!is_windows || env::var("CUDA_PATH").is_ok()),
         Err(_) => false,
     };
 

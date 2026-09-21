@@ -1,4 +1,6 @@
+#[cfg(has_cuda)]
 use std::ffi::CStr;
+#[cfg(has_cuda)]
 use std::os::raw::{c_char, c_int, c_void};
 
 #[derive(Clone, Debug)]

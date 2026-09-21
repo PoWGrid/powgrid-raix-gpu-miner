@@ -180,3 +180,47 @@ __device__ __forceinline__ void aes256_encrypt_block(const uint32_t rk[15][4], c
               ((uint32_t)AES_SBOX[(s1 >> 8) & 0xff] << 8) |
               ((uint32_t)AES_SBOX[s2 & 0xff])) ^ rk[14][3];
 }
+
+__device__ __forceinline__ void aes256_encrypt_block_smem(
+    const uint32_t rk[15][4],
+    const uint32_t in[4],
+    uint32_t out[4],
+    const uint32_t* __restrict__ s_te0,
+    const uint8_t* __restrict__ s_sbox
+) {
+    uint32_t s0 = in[0] ^ rk[0][0];
+    uint32_t s1 = in[1] ^ rk[0][1];
+    uint32_t s2 = in[2] ^ rk[0][2];
+    uint32_t s3 = in[3] ^ rk[0][3];
+
+    #pragma unroll
+    for (int r = 1; r < 14; r++) {
+        uint32_t t0 = s_te0[(s0 >> 24) & 0xff] ^ aes_rotr32(s_te0[(uint8_t)(s1 >> 16)], 8) ^ aes_rotr32(s_te0[(uint8_t)(s2 >> 8)], 16) ^ aes_rotr32(s_te0[(uint8_t)s3], 24) ^ rk[r][0];
+        uint32_t t1 = s_te0[(s1 >> 24) & 0xff] ^ aes_rotr32(s_te0[(uint8_t)(s2 >> 16)], 8) ^ aes_rotr32(s_te0[(uint8_t)(s3 >> 8)], 16) ^ aes_rotr32(s_te0[(uint8_t)s0], 24) ^ rk[r][1];
+        uint32_t t2 = s_te0[(s2 >> 24) & 0xff] ^ aes_rotr32(s_te0[(uint8_t)(s3 >> 16)], 8) ^ aes_rotr32(s_te0[(uint8_t)(s0 >> 8)], 16) ^ aes_rotr32(s_te0[(uint8_t)s1], 24) ^ rk[r][2];
+        uint32_t t3 = s_te0[(s3 >> 24) & 0xff] ^ aes_rotr32(s_te0[(uint8_t)(s0 >> 16)], 8) ^ aes_rotr32(s_te0[(uint8_t)(s1 >> 8)], 16) ^ aes_rotr32(s_te0[(uint8_t)s2], 24) ^ rk[r][3];
+        s0 = t0; s1 = t1; s2 = t2; s3 = t3;
+    }
+
+    // Round 14 (Final round, no MixColumns)
+    out[0] = (((uint32_t)s_sbox[(s0 >> 24) & 0xff] << 24) |
+              ((uint32_t)s_sbox[(s1 >> 16) & 0xff] << 16) |
+              ((uint32_t)s_sbox[(s2 >> 8) & 0xff] << 8) |
+              ((uint32_t)s_sbox[s3 & 0xff])) ^ rk[14][0];
+
+    out[1] = (((uint32_t)s_sbox[(s1 >> 24) & 0xff] << 24) |
+              ((uint32_t)s_sbox[(s2 >> 16) & 0xff] << 16) |
+              ((uint32_t)s_sbox[(s3 >> 8) & 0xff] << 8) |
+              ((uint32_t)s_sbox[s0 & 0xff])) ^ rk[14][1];
+
+    out[2] = (((uint32_t)s_sbox[(s2 >> 24) & 0xff] << 24) |
+              ((uint32_t)s_sbox[(s3 >> 16) & 0xff] << 16) |
+              ((uint32_t)s_sbox[(s0 >> 8) & 0xff] << 8) |
+              ((uint32_t)s_sbox[s1 & 0xff])) ^ rk[14][2];
+
+    out[3] = (((uint32_t)s_sbox[(s3 >> 24) & 0xff] << 24) |
+              ((uint32_t)s_sbox[(s0 >> 16) & 0xff] << 16) |
+              ((uint32_t)s_sbox[(s1 >> 8) & 0xff] << 8) |
+              ((uint32_t)s_sbox[s2 & 0xff])) ^ rk[14][3];
+}
+

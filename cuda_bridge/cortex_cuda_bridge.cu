@@ -675,6 +675,223 @@ __global__ void cortex_mine_v2_kernel(
     }
 }
 
+__global__ void cortex_mine_v22_kernel(
+    const char* d_prefix, int prefix_len,
+    const char* d_suffix, int suffix_len,
+    const char* d_seed, int seed_len,
+    int target_diff,
+    uint64_t target_u64,
+    uint64_t base_nonce,
+    int nonces_per_thread,
+    int64_t* d_scratchpads_v22,
+    int total_v22_threads,
+    int* d_found_count,
+    uint64_t* d_found_nonces
+) {
+    __shared__ uint32_t s_TE0[256];
+    __shared__ uint8_t s_SBOX[256];
+    if (threadIdx.x < 256) {
+        s_TE0[threadIdx.x] = AES_TE0[threadIdx.x];
+        s_SBOX[threadIdx.x] = AES_SBOX[threadIdx.x];
+    }
+    __syncthreads();
+
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total_v22_threads) return;
+
+    uint64_t thread_base = base_nonce + (uint64_t)tid * (uint64_t)nonces_per_thread;
+
+    for (int n = 0; n < nonces_per_thread; n++) {
+        if (*d_found_count > 0) return;
+
+        uint64_t nonce = thread_base + (uint64_t)n;
+
+        char header[384];
+        for (int i = 0; i < prefix_len; i++) header[i] = d_prefix[i];
+        int nonce_len = u64_to_str(nonce, header + prefix_len);
+        int cur_len = prefix_len + nonce_len;
+        for (int i = 0; i < suffix_len; i++) header[cur_len + i] = d_suffix[i];
+        int header_len = cur_len + suffix_len;
+
+        // 1. seed_key = sha256(header + ":" + seed)
+        uint8_t hs_buf[384];
+        for (int i = 0; i < header_len; i++) hs_buf[i] = (uint8_t)header[i];
+        hs_buf[header_len] = ':';
+        for (int i = 0; i < seed_len; i++) hs_buf[header_len + 1 + i] = (uint8_t)d_seed[i];
+        int hs_len = header_len + 1 + seed_len;
+
+        uint8_t seed_key[32];
+        cuda_sha256(hs_buf, hs_len, seed_key);
+
+        // 2. iv = sha256(seed + ":" + header + ":v2.2-iv")[0..16]
+        uint8_t iv_buf[384];
+        for (int i = 0; i < seed_len; i++) iv_buf[i] = (uint8_t)d_seed[i];
+        iv_buf[seed_len] = ':';
+        for (int i = 0; i < header_len; i++) iv_buf[seed_len + 1 + i] = (uint8_t)header[i];
+        int iv_pre_len = seed_len + 1 + header_len;
+        const char* iv_suffix = ":v2.2-iv";
+        for (int i = 0; i < 8; i++) iv_buf[iv_pre_len + i] = (uint8_t)iv_suffix[i];
+        int iv_len = iv_pre_len + 8;
+
+        uint8_t iv_full[32];
+        cuda_sha256(iv_buf, iv_len, iv_full);
+
+        // 3. initial_digest = sha512(seed + ":" + header)
+        uint8_t sh_buf[384];
+        for (int i = 0; i < seed_len; i++) sh_buf[i] = (uint8_t)d_seed[i];
+        sh_buf[seed_len] = ':';
+        for (int i = 0; i < header_len; i++) sh_buf[seed_len + 1 + i] = (uint8_t)header[i];
+        int sh_len = seed_len + 1 + header_len;
+
+        uint8_t initial_digest[64];
+        cuda_sha512(sh_buf, sh_len, initial_digest);
+
+        // 4. Initialize registers
+        int64_t r[8];
+        for (int i = 0; i < 8; i++) {
+            uint64_t val = 0;
+            for (int b = 0; b < 8; b++) {
+                val |= ((uint64_t)initial_digest[i * 8 + b]) << (b * 8);
+            }
+            r[i] = (int64_t)val;
+        }
+
+        double f[4];
+        for (int i = 0; i < 4; i++) {
+            f[i] = (double)(r[i] % 1000000) / 1000.0;
+        }
+
+        // Expand AES-256 round keys
+        uint32_t rk[15][4];
+        aes256_key_expansion(seed_key, rk);
+
+        // Sequential AES-256-CBC fill of 131,072 blocks with on-the-fly 64-word fold accumulation
+        uint32_t block[4];
+        block[0] = ((uint32_t)iv_full[0] << 24) | ((uint32_t)iv_full[1] << 16) | ((uint32_t)iv_full[2] << 8) | ((uint32_t)iv_full[3]);
+        block[1] = ((uint32_t)iv_full[4] << 24) | ((uint32_t)iv_full[5] << 16) | ((uint32_t)iv_full[6] << 8) | ((uint32_t)iv_full[7]);
+        block[2] = ((uint32_t)iv_full[8] << 24) | ((uint32_t)iv_full[9] << 16) | ((uint32_t)iv_full[10] << 8) | ((uint32_t)iv_full[11]);
+        block[3] = ((uint32_t)iv_full[12] << 24) | ((uint32_t)iv_full[13] << 16) | ((uint32_t)iv_full[14] << 8) | ((uint32_t)iv_full[15]);
+
+        int64_t fold64[64];
+        #pragma unroll
+        for (int j = 0; j < 64; j++) fold64[j] = 0;
+
+        for (int b = 0; b < 131072; b++) {
+            aes256_encrypt_block_smem(rk, block, block, s_TE0, s_SBOX);
+
+            uint32_t lo0 = cuda_bswap32(block[0]);
+            uint32_t hi0 = cuda_bswap32(block[1]);
+            int64_t w0 = (int64_t)(((uint64_t)hi0 << 32) | (uint64_t)lo0);
+
+            uint32_t lo1 = cuda_bswap32(block[2]);
+            uint32_t hi1 = cuda_bswap32(block[3]);
+            int64_t w1 = (int64_t)(((uint64_t)hi1 << 32) | (uint64_t)lo1);
+
+            int word_idx0 = b * 2;
+            int word_idx1 = word_idx0 + 1;
+            d_scratchpads_v22[(size_t)word_idx0 * (size_t)total_v22_threads + (size_t)tid] = w0;
+            d_scratchpads_v22[(size_t)word_idx1 * (size_t)total_v22_threads + (size_t)tid] = w1;
+
+            fold64[word_idx0 & 63] ^= w0;
+            fold64[word_idx1 & 63] ^= w1;
+        }
+
+        // 128-cycle RandomX VM loop
+        const uint32_t mask = 262143;
+        for (int iter = 0; iter < 128; iter++) {
+            uint8_t opCode = (initial_digest[iter % 64] ^ (uint8_t)d_seed[iter % seed_len]) % 10;
+            int src = (iter + 1) & 7;
+            int dst = iter & 7;
+            uint32_t memIdx = ((uint32_t)r[dst]) & mask;
+
+            switch (opCode) {
+                case 0: {
+                    int64_t m = d_scratchpads_v22[(size_t)memIdx * (size_t)total_v22_threads + (size_t)tid];
+                    r[dst] = r[dst] + m;
+                    break;
+                }
+                case 1: r[dst] = r[dst] - r[src]; break;
+                case 2: r[dst] = r[dst] * (r[src] | 1ULL); break;
+                case 3: r[dst] ^= r[src]; break;
+                case 4: {
+                    uint32_t shift = (uint32_t)r[src] & 63;
+                    int64_t sr = r[dst];
+                    int64_t right = (shift == 0) ? ((sr < 0) ? -1LL : 0LL) : (sr >> (64 - shift));
+                    r[dst] = (int64_t)(((uint64_t)sr << shift) | (uint64_t)right);
+                    break;
+                }
+                case 5: {
+                    size_t offset = (size_t)memIdx * (size_t)total_v22_threads + (size_t)tid;
+                    int64_t old_val = d_scratchpads_v22[offset];
+                    int64_t new_val = r[dst] ^ (int64_t)iter;
+                    d_scratchpads_v22[offset] = new_val;
+                    fold64[memIdx & 63] ^= (old_val ^ new_val);
+                    break;
+                }
+                case 6: {
+                    f[dst % 4] += f[src % 4];
+                    r[dst] ^= (int64_t)floor(fabs(f[dst % 4]));
+                    break;
+                }
+                case 7: {
+                    f[dst % 4] *= 1.00001;
+                    r[dst] ^= (int64_t)floor(fabs(f[dst % 4]));
+                    break;
+                }
+                case 8: {
+                    uint32_t nextMem = (memIdx + 64) & mask;
+                    size_t off1 = (size_t)memIdx * (size_t)total_v22_threads + (size_t)tid;
+                    size_t off2 = (size_t)nextMem * (size_t)total_v22_threads + (size_t)tid;
+                    int64_t tmp1 = d_scratchpads_v22[off1];
+                    int64_t tmp2 = d_scratchpads_v22[off2];
+                    d_scratchpads_v22[off1] = tmp2;
+                    d_scratchpads_v22[off2] = tmp1;
+                    break;
+                }
+                case 9: r[dst] = -r[dst]; break;
+            }
+        }
+
+        // Step 4 Final Sponge Digest
+        uint8_t finalBuf[64];
+        for (int i = 0; i < 8; i++) {
+            uint64_t val = (uint64_t)r[i];
+            for (int b = 0; b < 8; b++) {
+                finalBuf[i * 8 + b] = (uint8_t)(val >> (b * 8));
+            }
+        }
+
+        uint8_t h1[32];
+        cuda_sha256_64bytes(finalBuf, h1);
+
+        uint8_t h2[32];
+        cuda_sha256_sponge(h1, fold64, h2);
+
+        // Check target difficulty
+        bool match = false;
+        if (target_u64 > 0) {
+            uint64_t h2_u64 = ((uint64_t)h2[0] << 56) | ((uint64_t)h2[1] << 48) |
+                              ((uint64_t)h2[2] << 40) | ((uint64_t)h2[3] << 32) |
+                              ((uint64_t)h2[4] << 24) | ((uint64_t)h2[5] << 16) |
+                              ((uint64_t)h2[6] << 8)  | ((uint64_t)h2[7]);
+            match = (h2_u64 <= target_u64);
+        } else {
+            match = true;
+            for (int k = 0; k < target_diff; k++) {
+                uint8_t nibble = (k % 2 == 0) ? (h2[k / 2] >> 4) : (h2[k / 2] & 0x0F);
+                if (nibble != 0) { match = false; break; }
+            }
+        }
+
+        if (match) {
+            int slot = atomicAdd(d_found_count, 1);
+            if (slot < MAX_SOLUTIONS) {
+                d_found_nonces[slot] = nonce;
+            }
+        }
+    }
+}
+
 // Single-hash test kernel
 __global__ void cortex_test_kernel(
     const char* d_header, int header_len,
@@ -934,6 +1151,169 @@ __global__ void cortex_test_v2_kernel(
     cuda_sha256_sponge(h1, spongeHead, d_out_hash);
 }
 
+__global__ void cortex_test_v22_kernel(
+    const char* d_header, int header_len,
+    const char* d_seed, int seed_len,
+    int64_t* d_scratchpad_v22,
+    uint8_t* d_out_hash
+) {
+    __shared__ uint32_t s_TE0[256];
+    __shared__ uint8_t s_SBOX[256];
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < 256; i++) {
+            s_TE0[i] = AES_TE0[i];
+            s_SBOX[i] = AES_SBOX[i];
+        }
+    }
+    __syncthreads();
+
+    // 1. seed_key = sha256(header + ":" + seed)
+    uint8_t hs_buf[384];
+    for (int i = 0; i < header_len; i++) hs_buf[i] = (uint8_t)d_header[i];
+    hs_buf[header_len] = ':';
+    for (int i = 0; i < seed_len; i++) hs_buf[header_len + 1 + i] = (uint8_t)d_seed[i];
+    int hs_len = header_len + 1 + seed_len;
+
+    uint8_t seed_key[32];
+    cuda_sha256(hs_buf, hs_len, seed_key);
+
+    // 2. iv = sha256(seed + ":" + header + ":v2.2-iv")[0..16]
+    uint8_t iv_buf[384];
+    for (int i = 0; i < seed_len; i++) iv_buf[i] = (uint8_t)d_seed[i];
+    iv_buf[seed_len] = ':';
+    for (int i = 0; i < header_len; i++) iv_buf[seed_len + 1 + i] = (uint8_t)d_header[i];
+    int iv_pre_len = seed_len + 1 + header_len;
+    const char* iv_suffix = ":v2.2-iv";
+    for (int i = 0; i < 8; i++) iv_buf[iv_pre_len + i] = (uint8_t)iv_suffix[i];
+    int iv_len = iv_pre_len + 8;
+
+    uint8_t iv_full[32];
+    cuda_sha256(iv_buf, iv_len, iv_full);
+
+    // 3. initial_digest = sha512(seed + ":" + header)
+    uint8_t sh_buf[384];
+    for (int i = 0; i < seed_len; i++) sh_buf[i] = (uint8_t)d_seed[i];
+    sh_buf[seed_len] = ':';
+    for (int i = 0; i < header_len; i++) sh_buf[seed_len + 1 + i] = (uint8_t)d_header[i];
+    int sh_len = seed_len + 1 + header_len;
+
+    uint8_t initial_digest[64];
+    cuda_sha512(sh_buf, sh_len, initial_digest);
+
+    // 4. Initialize registers
+    int64_t r[8];
+    for (int i = 0; i < 8; i++) {
+        uint64_t val = 0;
+        for (int b = 0; b < 8; b++) {
+            val |= ((uint64_t)initial_digest[i * 8 + b]) << (b * 8);
+        }
+        r[i] = (int64_t)val;
+    }
+
+    double f[4];
+    for (int i = 0; i < 4; i++) {
+        f[i] = (double)(r[i] % 1000000) / 1000.0;
+    }
+
+    // Expand AES-256 round keys
+    uint32_t rk[15][4];
+    aes256_key_expansion(seed_key, rk);
+
+    uint32_t block[4];
+    block[0] = ((uint32_t)iv_full[0] << 24) | ((uint32_t)iv_full[1] << 16) | ((uint32_t)iv_full[2] << 8) | ((uint32_t)iv_full[3]);
+    block[1] = ((uint32_t)iv_full[4] << 24) | ((uint32_t)iv_full[5] << 16) | ((uint32_t)iv_full[6] << 8) | ((uint32_t)iv_full[7]);
+    block[2] = ((uint32_t)iv_full[8] << 24) | ((uint32_t)iv_full[9] << 16) | ((uint32_t)iv_full[10] << 8) | ((uint32_t)iv_full[11]);
+    block[3] = ((uint32_t)iv_full[12] << 24) | ((uint32_t)iv_full[13] << 16) | ((uint32_t)iv_full[14] << 8) | ((uint32_t)iv_full[15]);
+
+    int64_t fold64[64];
+    for (int j = 0; j < 64; j++) fold64[j] = 0;
+
+    for (int b = 0; b < 131072; b++) {
+        aes256_encrypt_block_smem(rk, block, block, s_TE0, s_SBOX);
+
+        uint32_t lo0 = cuda_bswap32(block[0]);
+        uint32_t hi0 = cuda_bswap32(block[1]);
+        int64_t w0 = (int64_t)(((uint64_t)hi0 << 32) | (uint64_t)lo0);
+
+        uint32_t lo1 = cuda_bswap32(block[2]);
+        uint32_t hi1 = cuda_bswap32(block[3]);
+        int64_t w1 = (int64_t)(((uint64_t)hi1 << 32) | (uint64_t)lo1);
+
+        int word_idx0 = b * 2;
+        int word_idx1 = word_idx0 + 1;
+        d_scratchpad_v22[word_idx0] = w0;
+        d_scratchpad_v22[word_idx1] = w1;
+
+        fold64[word_idx0 & 63] ^= w0;
+        fold64[word_idx1 & 63] ^= w1;
+    }
+
+    const uint32_t mask = 262143;
+    for (int iter = 0; iter < 128; iter++) {
+        uint8_t opCode = (initial_digest[iter % 64] ^ (uint8_t)d_seed[iter % seed_len]) % 10;
+        int src = (iter + 1) & 7;
+        int dst = iter & 7;
+        uint32_t memIdx = ((uint32_t)r[dst]) & mask;
+
+        switch (opCode) {
+            case 0: {
+                int64_t m = d_scratchpad_v22[memIdx];
+                r[dst] = r[dst] + m;
+                break;
+            }
+            case 1: r[dst] = r[dst] - r[src]; break;
+            case 2: r[dst] = r[dst] * (r[src] | 1ULL); break;
+            case 3: r[dst] ^= r[src]; break;
+            case 4: {
+                uint32_t shift = (uint32_t)r[src] & 63;
+                int64_t sr = r[dst];
+                int64_t right = (shift == 0) ? ((sr < 0) ? -1LL : 0LL) : (sr >> (64 - shift));
+                r[dst] = (int64_t)(((uint64_t)sr << shift) | (uint64_t)right);
+                break;
+            }
+            case 5: {
+                int64_t old_val = d_scratchpad_v22[memIdx];
+                int64_t new_val = r[dst] ^ (int64_t)iter;
+                d_scratchpad_v22[memIdx] = new_val;
+                fold64[memIdx & 63] ^= (old_val ^ new_val);
+                break;
+            }
+            case 6: {
+                f[dst % 4] += f[src % 4];
+                r[dst] ^= (int64_t)floor(fabs(f[dst % 4]));
+                break;
+            }
+            case 7: {
+                f[dst % 4] *= 1.00001;
+                r[dst] ^= (int64_t)floor(fabs(f[dst % 4]));
+                break;
+            }
+            case 8: {
+                uint32_t nextMem = (memIdx + 64) & mask;
+                int64_t tmp1 = d_scratchpad_v22[memIdx];
+                int64_t tmp2 = d_scratchpad_v22[nextMem];
+                d_scratchpad_v22[memIdx] = tmp2;
+                d_scratchpad_v22[nextMem] = tmp1;
+                break;
+            }
+            case 9: r[dst] = -r[dst]; break;
+        }
+    }
+
+    uint8_t finalBuf[64];
+    for (int i = 0; i < 8; i++) {
+        uint64_t val = (uint64_t)r[i];
+        for (int b = 0; b < 8; b++) {
+            finalBuf[i * 8 + b] = (uint8_t)(val >> (b * 8));
+        }
+    }
+
+    uint8_t h1[32];
+    cuda_sha256_64bytes(finalBuf, h1);
+
+    cuda_sha256_sponge(h1, fold64, d_out_hash);
+}
+
 struct CudaWorkerContext {
     int device_id;
     int total_threads;
@@ -943,6 +1323,10 @@ struct CudaWorkerContext {
     cudaStream_t stream;
 
     int64_t* d_scratchpads;
+    int64_t* d_scratchpads_v22;
+    int v22_total_threads;
+    int v22_blocks;
+
     char* d_prefix;
     char* d_suffix;
     char* d_seed;
@@ -993,18 +1377,34 @@ void* cuda_bridge_worker_create(int device_id, int total_threads, int nonces_per
 
     cudaStreamCreate(&ctx->stream);
 
-    // Coalesced scratchpad size: total_threads * 4096 * 8 bytes
-    size_t sp_size = (size_t)ctx->total_threads * 4096 * sizeof(int64_t);
-    cudaError_t err = cudaMalloc(&ctx->d_scratchpads, sp_size);
-    if (err != cudaSuccess) {
-        // Fallback to smaller thread count if VRAM is tight
-        ctx->total_threads = 24576;
-        ctx->blocks = ctx->total_threads / ctx->threads_per_block;
-        sp_size = (size_t)ctx->total_threads * 4096 * sizeof(int64_t);
-        if (cudaMalloc(&ctx->d_scratchpads, sp_size) != cudaSuccess) {
-            free(ctx);
-            return NULL;
+    // Scratchpads for v1 will be allocated lazily in run_batch if a v1 job is executed.
+    ctx->d_scratchpads = NULL;
+
+    // Adaptive v2.2 Scratchpad allocation (2MB per thread interleaved)
+    // Try 2560 -> 2048 -> 1536 -> 1024 -> 768 -> 512 -> 256 -> 128 -> 64 threads
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+
+    ctx->d_scratchpads_v22 = NULL;
+    ctx->v22_total_threads = 0;
+    ctx->v22_blocks = 0;
+
+    int candidate_threads[] = { 2560, 2048, 1536, 1024, 768, 512, 256, 128, 64 };
+    for (int i = 0; i < (int)(sizeof(candidate_threads) / sizeof(candidate_threads[0])); i++) {
+        int th = candidate_threads[i];
+        size_t needed = (size_t)th * 262144ULL * sizeof(int64_t);
+        if (free_mem > needed + (size_t)(256 * 1024 * 1024)) {
+            if (cudaMalloc(&ctx->d_scratchpads_v22, needed) == cudaSuccess) {
+                ctx->v22_total_threads = th;
+                ctx->v22_blocks = (th + ctx->threads_per_block - 1) / ctx->threads_per_block;
+                break;
+            }
         }
+    }
+
+    if (ctx->v22_total_threads > 0) {
+        printf("[CUDA] Allocated %d v2.2 concurrent threads (%.1f GB VRAM reserved for 2MB scratchpads)\n",
+               ctx->v22_total_threads, (double)(ctx->v22_total_threads * 2) / 1024.0);
     }
 
     cudaMalloc(&ctx->d_prefix, 512);
@@ -1026,6 +1426,7 @@ void cuda_bridge_worker_destroy(void* handle) {
     cudaSetDevice(ctx->device_id);
     if (ctx->stream) cudaStreamDestroy(ctx->stream);
     if (ctx->d_scratchpads) cudaFree(ctx->d_scratchpads);
+    if (ctx->d_scratchpads_v22) cudaFree(ctx->d_scratchpads_v22);
     if (ctx->d_prefix) cudaFree(ctx->d_prefix);
     if (ctx->d_suffix) cudaFree(ctx->d_suffix);
     if (ctx->d_seed) cudaFree(ctx->d_seed);
@@ -1071,10 +1472,35 @@ int cuda_bridge_worker_run_batch(
     // Reset found count
     cudaMemsetAsync(ctx->d_found_count, 0, sizeof(int), ctx->stream);
 
-    // Launch mining kernel
-    bool is_v2 = (seed && (strstr(seed, "v2") != NULL || strstr(seed, "reticulum-randomx-v2") != NULL));
+    // Ensure null-terminated seed for reliable strstr parsing
+    char seed_str[256];
+    int slen = (seed_len < 255) ? seed_len : 255;
+    if (seed && slen > 0) {
+        memcpy(seed_str, seed, slen);
+        seed_str[slen] = '\0';
+    } else {
+        seed_str[0] = '\0';
+    }
 
-    if (is_v2) {
+    // Launch mining kernel
+    bool is_v22 = (strstr(seed_str, "v2.2") != NULL || strstr(seed_str, "reticulum-randomx-v2.2") != NULL);
+    bool is_v2 = !is_v22 && (strstr(seed_str, "v2") != NULL || strstr(seed_str, "reticulum-randomx-v2") != NULL);
+
+    if (is_v22 && ctx->d_scratchpads_v22) {
+        cortex_mine_v22_kernel<<<ctx->v22_blocks, ctx->threads_per_block, 0, ctx->stream>>>(
+            ctx->d_prefix, prefix_len,
+            ctx->d_suffix, suffix_len,
+            ctx->d_seed, seed_len,
+            target_diff,
+            target_u64,
+            base_nonce,
+            ctx->nonces_per_thread,
+            ctx->d_scratchpads_v22,
+            ctx->v22_total_threads,
+            ctx->d_found_count,
+            ctx->d_found_nonces
+        );
+    } else if (is_v2) {
         cortex_mine_v2_kernel<<<ctx->blocks, ctx->threads_per_block, 0, ctx->stream>>>(
             ctx->d_prefix, prefix_len,
             ctx->d_suffix, suffix_len,
@@ -1087,6 +1513,15 @@ int cuda_bridge_worker_run_batch(
             ctx->d_found_nonces
         );
     } else {
+        if (!ctx->d_scratchpads) {
+            size_t sp_size = (size_t)ctx->total_threads * 4096 * sizeof(int64_t);
+            if (cudaMalloc(&ctx->d_scratchpads, sp_size) != cudaSuccess) {
+                ctx->total_threads = 16384;
+                ctx->blocks = ctx->total_threads / ctx->threads_per_block;
+                sp_size = (size_t)ctx->total_threads * 4096 * sizeof(int64_t);
+                cudaMalloc(&ctx->d_scratchpads, sp_size);
+            }
+        }
         cortex_mine_kernel<<<ctx->blocks, ctx->threads_per_block, 0, ctx->stream>>>(
             ctx->d_prefix, prefix_len,
             ctx->d_suffix, suffix_len,
@@ -1103,7 +1538,14 @@ int cuda_bridge_worker_run_batch(
 
     int h_found_count = 0;
     cudaMemcpyAsync(&h_found_count, ctx->d_found_count, sizeof(int), cudaMemcpyDeviceToHost, ctx->stream);
-    cudaStreamSynchronize(ctx->stream);
+    cudaError_t kerr = cudaGetLastError();
+    if (kerr != cudaSuccess) {
+        printf("[CUDA ERROR] Kernel launch error: %s\n", cudaGetErrorString(kerr));
+    }
+    cudaError_t serr = cudaStreamSynchronize(ctx->stream);
+    if (serr != cudaSuccess) {
+        printf("[CUDA ERROR] Stream sync error: %s\n", cudaGetErrorString(serr));
+    }
 
     if (h_found_count > 0 && found_nonces_out && max_found > 0) {
         int copy_count = (h_found_count > max_found) ? max_found : h_found_count;
@@ -1114,7 +1556,8 @@ int cuda_bridge_worker_run_batch(
     }
 
     if (hashes_done_out) {
-        *hashes_done_out = (uint64_t)ctx->total_threads * (uint64_t)ctx->nonces_per_thread;
+        uint64_t threads = (is_v22 && ctx->d_scratchpads_v22) ? (uint64_t)ctx->v22_total_threads : (uint64_t)ctx->total_threads;
+        *hashes_done_out = threads * (uint64_t)ctx->nonces_per_thread;
     }
     return 0;
 }
@@ -1198,9 +1641,47 @@ int cuda_bridge_self_test(int device_id) {
         0x96, 0x24, 0xe8, 0x9d, 0xab, 0x9b, 0xe5, 0x46,
         0x2b, 0x79, 0x68, 0x07, 0x9e, 0x6b, 0xf2, 0x2f
     };
+    if (memcmp(res_v2, exp_v2, 32) != 0) {
+        cudaFree(d_sp); cudaFree(d_hash); cudaFree(d_hdr); cudaFree(d_seed);
+        return 0;
+    }
+
+    // Test Vector v2.2 Hard Fork (2MB scratchpad)
+    int64_t* d_sp_v22 = NULL;
+    if (cudaMalloc(&d_sp_v22, 262144 * sizeof(int64_t)) == cudaSuccess) {
+        const char* seed_v22 = "reticulum-randomx-v2.2-epoch-18";
+        int s_v22_len = strlen(seed_v22);
+        const char* hdr_v22 = "test_header";
+        int h_v22_len = strlen(hdr_v22);
+
+        cudaMemcpy(d_seed, seed_v22, s_v22_len, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_hdr, hdr_v22, h_v22_len, cudaMemcpyHostToDevice);
+
+        cortex_test_v22_kernel<<<1, 1>>>(d_hdr, h_v22_len, d_seed, s_v22_len, d_sp_v22, d_hash);
+        cudaDeviceSynchronize();
+
+        uint8_t res_v22[32];
+        cudaMemcpy(res_v22, d_hash, 32, cudaMemcpyDeviceToHost);
+        cudaFree(d_sp_v22);
+
+        const uint8_t exp_v22[32] = {
+            0x3c, 0xd0, 0x83, 0x24, 0xba, 0x2b, 0xbc, 0x68,
+            0x8f, 0xce, 0x17, 0xa9, 0x9a, 0x6b, 0xad, 0xf1,
+            0x85, 0xca, 0x8d, 0x28, 0x5f, 0x09, 0x35, 0x0c,
+            0x6f, 0xbf, 0xbf, 0x3e, 0x17, 0xc2, 0xca, 0x88
+        };
+        if (memcmp(res_v22, exp_v22, 32) != 0) {
+            cudaFree(d_sp); cudaFree(d_hash); cudaFree(d_hdr); cudaFree(d_seed);
+            return 0;
+        }
+    } else {
+        cudaFree(d_sp); cudaFree(d_hash); cudaFree(d_hdr); cudaFree(d_seed);
+        return 0;
+    }
 
     cudaFree(d_sp); cudaFree(d_hash); cudaFree(d_hdr); cudaFree(d_seed);
-    return (memcmp(res_v2, exp_v2, 32) == 0) ? 1 : 0;
+    return 1;
 }
 
 }
+

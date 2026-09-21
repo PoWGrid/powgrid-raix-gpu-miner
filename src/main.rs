@@ -18,13 +18,17 @@ use std::time::{Duration, Instant};
 // =========================================================================
 
 extern "C" fn sigint_handler(_: libc::c_int) {
+    let msg = b"\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n";
+    #[cfg(unix)]
     unsafe {
-        let msg = b"\x1b[?25h\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n";
-        #[cfg(unix)]
         libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
-        #[cfg(unix)]
         libc::_exit(0);
-        #[cfg(windows)]
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(msg);
+        let _ = std::io::stdout().flush();
         std::process::exit(0);
     }
 }
@@ -273,9 +277,10 @@ fn main() {
     let mut backend_pref = BackendType::Auto;
     let mut selected_devices: Option<Vec<usize>> = None;
     let mut batch_size: usize = 49152;
-    let mut nonces_per_thread: usize = 4;
+    let mut nonces_per_thread: usize = 1;
     let mut cli_diff: Option<f64> = None;
     let mut no_tui = false;
+    let mut is_benchmark = false;
 
     // Check config.txt or wallet.txt
     if let Ok(content) = fs::read_to_string("config.txt") {
@@ -313,7 +318,7 @@ fn main() {
                 pool_url = p;
                 i += 2;
             }
-            "--address" | "-a" | "-u" if i + 1 < args.len() => { address = args[i + 1].clone(); i += 2; }
+            "--address" | "--wallet" | "-a" | "-u" if i + 1 < args.len() => { address = args[i + 1].clone(); i += 2; }
             "--worker" | "-w" if i + 1 < args.len() => { worker = args[i + 1].clone(); worker_from_cli = true; i += 2; }
             "--backend" if i + 1 < args.len() => {
                 let b = args[i + 1].to_lowercase();
@@ -348,10 +353,15 @@ fn main() {
                 no_tui = true;
                 i += 1;
             }
+            "--benchmark" | "-b" => {
+                is_benchmark = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 println!("===========================================================");
-                println!("  ⚡ PowGrid Reticulum AI ($RAIX) Unified GPU Miner v2.1.1");
+                println!("  ⚡ PowGrid Reticulum AI ($RAIX) Unified GPU Miner v2.2.2");
                 println!("  Architecture        : Dual-Engine [Native CUDA + OpenCL JIT]");
+                println!("  Hardfork Support    : Titan-CPU v2.2 (Sequential AES-CBC + 2MB SoA)");
                 println!("===========================================================\n");
                 println!("Usage: powgrid-raix-gpu-miner [OPTIONS]\n");
                 println!("Options:");
@@ -361,7 +371,8 @@ fn main() {
                 println!("      --backend <cuda|opencl|auto>   Force compute backend (default: auto)");
                 println!("  -d, --devices <0,1,...|all>        Specify GPU device indices to use");
                 println!("      --diff <NUMBER>                Initial share difficulty target override");
-                println!("      --hiveos, --no-tui             Disable interactive ANSI HUD (for logs/rigs)");
+                println!("      --no-tui                       Disable interactive ANSI HUD (for logs/rigs)");
+                println!("  -b, --benchmark                    Run local v2.2 cryptographic benchmark and exit");
                 println!("  -h, --help                         Print this help menu and exit\n");
                 std::process::exit(0);
             }
@@ -370,8 +381,9 @@ fn main() {
     }
 
     println!("===========================================================");
-    println!("  ⚡ PowGrid Reticulum AI ($RAIX) Unified GPU Miner v2.1.1");
+    println!("  ⚡ PowGrid Reticulum AI ($RAIX) Unified GPU Miner v2.2.2");
     println!("  Architecture        : Dual-Engine [Native CUDA + OpenCL JIT]");
+    println!("  Hardfork Support    : Titan-CPU v2.2 (Sequential AES-CBC + 2MB SoA)");
     println!("  Target Hardware     : Any GPU (NVIDIA, AMD, Intel, Apple)");
     println!("===========================================================\n");
 
@@ -413,7 +425,7 @@ fn main() {
         io::stdout().flush().unwrap();
         let pass = DeviceManager::run_self_test(dev);
         if pass {
-            println!("✅ 100% BIT-PERFECT MATCH (Genesis v1 & Hard Fork v2.1)");
+            println!("✅ 100% BIT-PERFECT MATCH (Genesis v1 & Hard Fork v2.1 & v2.2)");
         } else {
             println!("❌ MISMATCH!");
             eprintln!("[FATAL] GPU #{} produced non-deterministic or incorrect hash outputs.", dev.id);
@@ -421,6 +433,59 @@ fn main() {
         }
     }
     println!();
+
+    // Local benchmark mode
+    if is_benchmark {
+        println!("===========================================================");
+        println!("  🚀 RUNNING LOCAL v2.2 CRYPTOGRAPHIC BENCHMARK");
+        println!("  Algorithm: RandomX-Cortex v2.2 (131,072 AES-CBC blocks / 2MB)");
+        println!("===========================================================\n");
+
+        for dev in &active_gpus {
+            println!("Initializing GPU #{} [{}]...", dev.id, dev.name);
+            let mut worker = match ActiveGpuWorker::new(dev, batch_size, nonces_per_thread) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Failed to initialize worker: {}", e);
+                    continue;
+                }
+            };
+
+            let prefix = b"test_header_";
+            let suffix = b"_bench_round";
+            let seed = b"reticulum-randomx-v2.2-epoch-18";
+            let target_u64 = 0; // Don't stop on shares
+            let target_diff = 32; // Unreachable diff so we measure pure hashrate
+
+            println!("Warming up GPU pipeline...");
+            let _ = worker.run_batch(prefix, suffix, seed, target_u64, target_diff, 0);
+
+            println!("Running 5-second sustained hashrate benchmark...");
+            let start = Instant::now();
+            let mut total_hashes: u64 = 0;
+            let mut nonce = 10000u64;
+
+            while start.elapsed().as_secs_f64() < 5.0 {
+                if let Ok((_, hashes)) = worker.run_batch(prefix, suffix, seed, target_u64, target_diff, nonce) {
+                    total_hashes += hashes;
+                    nonce += hashes;
+                }
+            }
+
+            let elapsed = start.elapsed().as_secs_f64();
+            let hashrate = (total_hashes as f64) / elapsed;
+
+            println!("\n-----------------------------------------------------------");
+            println!("  GPU #{} [{}] Benchmark Results:", dev.id, dev.name);
+            println!("  Total Hashes Done  : {}", format_number(total_hashes));
+            println!("  Time Elapsed       : {:.2} seconds", elapsed);
+            println!("  Sustained Hashrate : \x1b[1;32m{:.2} H/s\x1b[0m", hashrate);
+            println!("-----------------------------------------------------------\n");
+        }
+
+        println!("Benchmark complete.");
+        return;
+    }
 
     // 1-Click Interactive setup if address is empty
     if address.is_empty() {
@@ -459,7 +524,7 @@ fn main() {
     println!("[CONFIG] Wallet    : {}", address);
     println!("[CONFIG] Worker    : {}\n", worker);
 
-    // Hardware Auto-Tuning: calculate optimal initial difficulty based on total GPU compute units
+    // Hardware Auto-Tuning: calculate optimal initial difficulty based on total GPU compute units for v2.2
     let initial_diff = if let Some(d) = cli_diff {
         println!("[CONFIG] User difficulty override: {:.2}\n", d);
         d
@@ -467,24 +532,19 @@ fn main() {
         let mut total_est_hs = 0.0f64;
         for dev in &active_gpus {
             let per_cu = match dev.assigned {
-                AssignedBackend::Cuda(_) => 280_000.0,
-                AssignedBackend::OpenCl(_) => 200_000.0,
+                AssignedBackend::Cuda(_) => 7.5, // v2.2 Titan-CPU: ~7.5 H/s per SM (~195 H/s on RTX 5060)
+                AssignedBackend::OpenCl(_) => 5.0,
             };
             total_est_hs += (dev.compute_units.max(1) as f64) * per_cu;
         }
-        // Target: 1 share every 10 seconds (optimal balance between pool responsiveness and efficiency)
+        // Target: 1 share every ~12 seconds (optimal responsiveness for vardiff)
         // Expected hashes per share = 16^diff = 2^(4*diff)
-        // ideal_diff = ln(total_est_hs * 10s) / (4 * ln(2))
-        let target_sec = 10.0f64;
+        let target_sec = 12.0f64;
         let ideal = (total_est_hs * target_sec).ln() / (4.0 * std::f64::consts::LN_2);
         let rounded = (ideal * 20.0).round() / 20.0; // Round to nearest 0.05
-        let tuned = rounded.clamp(4.0, 9.0);
-        let hr_display = if total_est_hs >= 1_000_000.0 {
-            format!("{:.2} MH/s", total_est_hs / 1_000_000.0)
-        } else {
-            format!("{:.0} kH/s", total_est_hs / 1000.0)
-        };
-        println!("[AUTOTUNE] GPU compute capacity: ~{} -> Auto-tuned initial difficulty: {:.2} (target: ~10s per share)\n", hr_display, tuned);
+        let tuned = rounded.clamp(2.5, 4.0);
+        let hr_display = format!("{:.1} H/s", total_est_hs);
+        println!("[AUTOTUNE] GPU compute capacity: ~{} -> Auto-tuned initial difficulty: {:.2} (target: ~12s per share)\n", hr_display, tuned);
         tuned
     };
 
@@ -494,6 +554,7 @@ fn main() {
         ..Default::default()
     }));
     let total_hashes = Arc::new(AtomicU64::new(0));
+    let instant_hashrate_bits = Arc::new(AtomicU64::new(0));
     let accepted_shares = Arc::new(AtomicU32::new(0));
     let rejected_shares = Arc::new(AtomicU32::new(0));
     let blocks_found = Arc::new(AtomicU32::new(0));
@@ -658,14 +719,15 @@ fn main() {
     ));
 
     if !no_tui {
-        // Clear screen, scrollback and hide cursor for static UI
-        print!("\x1b[2J\x1b[3J\x1b[H\x1b[?25l");
+        // Switch to alternate screen buffer (\x1b[?1049h), disable autowrap (\x1b[?7l), clear screen, cursor home, hide cursor (\x1b[?25l)
+        print!("\x1b[?1049h\x1b[?7l\x1b[2J\x1b[H\x1b[?25l");
         let _ = io::stdout().flush();
     }
 
     // Reporter thread (Fixed static dashboard, 1s refresh, zero flicker)
     {
         let total_hashes = Arc::clone(&total_hashes);
+        let instant_hashrate_bits = Arc::clone(&instant_hashrate_bits);
         let accepted_shares = Arc::clone(&accepted_shares);
         let rejected_shares = Arc::clone(&rejected_shares);
         let blocks_found = Arc::clone(&blocks_found);
@@ -686,23 +748,17 @@ fn main() {
 
         thread::spawn(move || {
             let start_time = Instant::now();
-            let mut last_hashes = 0u64;
-            let mut last_time = Instant::now();
 
             while running.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_secs(1));
 
-                let now = Instant::now();
-                let elapsed = (now - last_time).as_secs_f64();
                 let curr_hashes = total_hashes.load(Ordering::Relaxed);
-                let delta = curr_hashes.saturating_sub(last_hashes);
-                let hs_instant = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
-
-                last_hashes = curr_hashes;
-                last_time = now;
 
                 let total_elapsed = start_time.elapsed().as_secs_f64();
                 let hs_avg = if total_elapsed > 0.0 { curr_hashes as f64 / total_elapsed } else { 0.0 };
+
+                let reported_instant = f64::from_bits(instant_hashrate_bits.load(Ordering::Relaxed));
+                let hs_instant = if reported_instant > 0.0 { reported_instant } else { hs_avg };
 
                 let (now_str, now_unit) = format_speed(hs_instant);
                 let (avg_str, avg_unit) = format_speed(hs_avg);
@@ -738,7 +794,7 @@ fn main() {
                 let border_bot = format!("╰{}╯\x1b[K\n", "─".repeat(76));
 
                 buf.push_str(&border_top);
-                buf.push_str(&box_row("\x1b[1;36m► POWGRID RETICULUM AI ($RAIX) HIGH-PERFORMANCE GPU MINER v2.1.1\x1b[0m", 74));
+                buf.push_str(&box_row("\x1b[1;36m► POWGRID RETICULUM AI ($RAIX) HIGH-PERFORMANCE GPU MINER v2.2.2\x1b[0m", 74));
                 buf.push_str(&two_col_row(
                     &format!("\x1b[90mPool:\x1b[0m \x1b[1;37m{}\x1b[0m", pool_display),
                     41,
@@ -845,6 +901,7 @@ fn main() {
     for (gpu_idx, dev) in active_gpus.into_iter().enumerate() {
         let active_job = Arc::clone(&active_job);
         let total_hashes = Arc::clone(&total_hashes);
+        let instant_hashrate_bits = Arc::clone(&instant_hashrate_bits);
         let submit_queue = Arc::clone(&submit_queue);
         let running = Arc::clone(&running);
         let address = address.clone();
@@ -893,8 +950,15 @@ fn main() {
                     continue;
                 }
 
+                let batch_start = Instant::now();
                 match gpu_worker.run_batch(&prefix, &suffix, &seed, target_u64, diff.round() as usize, nonce) {
                     Ok((found_nonces, hashes_done)) => {
+                        let batch_sec = batch_start.elapsed().as_secs_f64();
+                        if batch_sec > 0.0 {
+                            let hr = (hashes_done as f64) / batch_sec;
+                            instant_hashrate_bits.store(hr.to_bits(), Ordering::Relaxed);
+                        }
+
                         total_hashes.fetch_add(hashes_done, Ordering::Relaxed);
                         nonce = nonce.wrapping_add(hashes_done);
 
