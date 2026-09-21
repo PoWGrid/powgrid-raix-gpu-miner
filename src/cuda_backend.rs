@@ -2,6 +2,7 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct CudaDeviceInfo {
     pub device_id: i32,
     pub name: String,

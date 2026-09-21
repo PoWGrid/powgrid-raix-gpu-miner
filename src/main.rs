@@ -18,9 +18,15 @@ use std::time::{Duration, Instant};
 // =========================================================================
 
 extern "C" fn sigint_handler(_: libc::c_int) {
-    print!("\x1b[?25h\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n");
-    let _ = io::stdout().flush();
-    std::process::exit(0);
+    unsafe {
+        let msg = b"\x1b[?25h\x1b[0m\n\n  \x1b[1;33m[SHUTDOWN]\x1b[0m Miner stopped safely. Terminal restored.\n\n";
+        #[cfg(unix)]
+        libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len());
+        #[cfg(unix)]
+        libc::_exit(0);
+        #[cfg(windows)]
+        std::process::exit(0);
+    }
 }
 
 fn current_time_str() -> String {
@@ -294,7 +300,19 @@ fn main() {
     let mut worker_from_cli = false;
     while i < args.len() {
         match args[i].as_str() {
-            "--node" | "-n" | "-o" if i + 1 < args.len() => { pool_url = args[i + 1].clone(); i += 2; }
+            "--node" | "-n" | "-o" | "--pool" | "-p" if i + 1 < args.len() => {
+                let mut p = args[i + 1].clone();
+                if p.starts_with("wss://") {
+                    p = p.replacen("wss://", "https://", 1);
+                } else if p.starts_with("ws://") {
+                    p = p.replacen("ws://", "http://", 1);
+                }
+                if p.ends_with("/stratum") {
+                    p = p.trim_end_matches("/stratum").to_string();
+                }
+                pool_url = p;
+                i += 2;
+            }
             "--address" | "-a" | "-u" if i + 1 < args.len() => { address = args[i + 1].clone(); i += 2; }
             "--worker" | "-w" if i + 1 < args.len() => { worker = args[i + 1].clone(); worker_from_cli = true; i += 2; }
             "--backend" if i + 1 < args.len() => {
@@ -330,12 +348,29 @@ fn main() {
                 no_tui = true;
                 i += 1;
             }
+            "--help" | "-h" => {
+                println!("===========================================================");
+                println!("  ⚡ PowGrid Reticulum AI ($RAIX) Unified GPU Miner v2.1.1");
+                println!("  Architecture        : Dual-Engine [Native CUDA + OpenCL JIT]");
+                println!("===========================================================\n");
+                println!("Usage: powgrid-raix-gpu-miner [OPTIONS]\n");
+                println!("Options:");
+                println!("  -p, --pool, -n, --node <URL>       Mining pool URL (default: https://raix.powgrid.xyz)");
+                println!("  -a, --address <ADDR>               Reticulum AI wallet address (ctx1...)");
+                println!("  -w, --worker <NAME>                Worker name (default: rig-gpu)");
+                println!("      --backend <cuda|opencl|auto>   Force compute backend (default: auto)");
+                println!("  -d, --devices <0,1,...|all>        Specify GPU device indices to use");
+                println!("      --diff <NUMBER>                Initial share difficulty target override");
+                println!("      --hiveos, --no-tui             Disable interactive ANSI HUD (for logs/rigs)");
+                println!("  -h, --help                         Print this help menu and exit\n");
+                std::process::exit(0);
+            }
             _ => { i += 1; }
         }
     }
 
     println!("===========================================================");
-    println!("  ⚡ PowGrid Reticulum AI ($RAIX) Unified GPU Miner v2.1");
+    println!("  ⚡ PowGrid Reticulum AI ($RAIX) Unified GPU Miner v2.1.1");
     println!("  Architecture        : Dual-Engine [Native CUDA + OpenCL JIT]");
     println!("  Target Hardware     : Any GPU (NVIDIA, AMD, Intel, Apple)");
     println!("===========================================================\n");
@@ -378,7 +413,7 @@ fn main() {
         io::stdout().flush().unwrap();
         let pass = DeviceManager::run_self_test(dev);
         if pass {
-            println!("✅ 100% BIT-PERFECT MATCH (Vectors 123 & 99999)");
+            println!("✅ 100% BIT-PERFECT MATCH (Genesis v1 & Hard Fork v2.1)");
         } else {
             println!("❌ MISMATCH!");
             eprintln!("[FATAL] GPU #{} produced non-deterministic or incorrect hash outputs.", dev.id);
@@ -476,6 +511,7 @@ fn main() {
         let active_job = Arc::clone(&active_job);
         let event_logger = Arc::clone(&event_logger);
         let running = Arc::clone(&running);
+        let submit_queue_poller = Arc::clone(&submit_queue);
 
         thread::spawn(move || {
             let agent = ureq::AgentBuilder::new()
@@ -499,6 +535,10 @@ fn main() {
                             let target_changed = job.target_u64 != target_u64;
 
                             if job_changed || diff_changed || seed_changed || target_changed {
+                                if job_changed {
+                                    let mut q = submit_queue_poller.lock().unwrap();
+                                    q.clear();
+                                }
                                 let old_diff = job.difficulty;
                                 job.job_id = job_id.clone();
                                 job.header_prefix = pfx.into_bytes();
@@ -528,8 +568,8 @@ fn main() {
         thread::sleep(Duration::from_millis(200));
     }
 
-    // Share submitter background worker
-    {
+    // Share submitter background workers (dual worker for instant dispatch)
+    for _ in 0..2 {
         let pool_url = pool_url.clone();
         let address = address.clone();
         let worker = worker.clone();
@@ -598,7 +638,7 @@ fn main() {
                         }
                     }
                 } else {
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(Duration::from_millis(30));
                 }
             }
         });
@@ -698,7 +738,7 @@ fn main() {
                 let border_bot = format!("╰{}╯\x1b[K\n", "─".repeat(76));
 
                 buf.push_str(&border_top);
-                buf.push_str(&box_row("\x1b[1;36m► POWGRID RETICULUM AI ($RAIX) HIGH-PERFORMANCE GPU MINER v2.1\x1b[0m", 74));
+                buf.push_str(&box_row("\x1b[1;36m► POWGRID RETICULUM AI ($RAIX) HIGH-PERFORMANCE GPU MINER v2.1.1\x1b[0m", 74));
                 buf.push_str(&two_col_row(
                     &format!("\x1b[90mPool:\x1b[0m \x1b[1;37m{}\x1b[0m", pool_display),
                     41,
@@ -860,6 +900,9 @@ fn main() {
 
                         for found_nonce in found_nonces {
                             let mut q = submit_queue.lock().unwrap();
+                            while q.len() > 16 {
+                                q.pop_front();
+                            }
                             q.push_back(ShareQueueItem {
                                 job_id: cur_job_id.clone(),
                                 nonce: found_nonce,

@@ -143,6 +143,7 @@ pub fn get_opencl_lib() -> Option<&'static OpenClLib> {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct OpenClDeviceInfo {
     pub platform_idx: usize,
     pub device_idx: usize,
@@ -216,6 +217,7 @@ pub struct OpenClWorker {
     queue: *mut c_void,
     program: *mut c_void,
     kernel: *mut c_void,
+    kernel_v2: *mut c_void,
     total_threads: usize,
     nonces_per_thread: usize,
 
@@ -285,12 +287,22 @@ impl OpenClWorker {
                 return Err(format!("clCreateKernel cortex_opencl_mine failed: {}", err));
             }
 
+            let k2_name = CString::new("cortex_opencl_mine_v2").unwrap();
+            let kernel_v2 = (cl.cl_create_kernel)(program, k2_name.as_ptr(), &mut err);
+            if err != 0 || kernel_v2.is_null() {
+                (cl.cl_release_kernel)(kernel);
+                (cl.cl_release_program)(program);
+                (cl.cl_release_command_queue)(queue);
+                (cl.cl_release_context)(context);
+                return Err(format!("clCreateKernel cortex_opencl_mine_v2 failed: {}", err));
+            }
+
             // Allocate buffers
             let d_prefix = (cl.cl_create_buffer)(context, CL_MEM_READ_ONLY, 512, std::ptr::null_mut(), &mut err);
             let d_suffix = (cl.cl_create_buffer)(context, CL_MEM_READ_ONLY, 512, std::ptr::null_mut(), &mut err);
             let d_seed = (cl.cl_create_buffer)(context, CL_MEM_READ_ONLY, 256, std::ptr::null_mut(), &mut err);
 
-            // Scratchpads: total_threads * 4096 * 8 bytes
+            // Scratchpads: total_threads * 4096 * 8 bytes (used by v1)
             let sp_bytes = total_threads * 4096 * 8;
             let d_scratchpads = (cl.cl_create_buffer)(context, CL_MEM_READ_WRITE, sp_bytes, std::ptr::null_mut(), &mut err);
             let d_found_count = (cl.cl_create_buffer)(context, CL_MEM_READ_WRITE, 4, std::ptr::null_mut(), &mut err);
@@ -306,6 +318,7 @@ impl OpenClWorker {
                 queue,
                 program,
                 kernel,
+                kernel_v2,
                 total_threads,
                 nonces_per_thread,
                 d_prefix,
@@ -357,24 +370,47 @@ impl OpenClWorker {
             let b_nonce = base_nonce;
             let n_per_t = self.nonces_per_thread as i32;
 
-            (cl.cl_set_kernel_arg)(self.kernel, 0, 8, &self.d_prefix as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 1, 4, &p_len as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 2, 8, &self.d_suffix as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 3, 4, &s_len as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 4, 8, &self.d_seed as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 5, 4, &sd_len as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 6, 4, &t_diff as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 7, 8, &t_u64 as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 8, 8, &b_nonce as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 9, 4, &n_per_t as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 10, 8, &self.d_scratchpads as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 11, 8, &self.d_found_count as *const _ as *const c_void);
-            (cl.cl_set_kernel_arg)(self.kernel, 12, 8, &self.d_found_nonces as *const _ as *const c_void);
+            let is_v2 = seed.windows(2).any(|w| w == b"v2");
 
-            let global_work = self.total_threads;
-            let err = (cl.cl_enqueue_nd_range_kernel)(self.queue, self.kernel, 1, std::ptr::null(), &global_work, std::ptr::null(), 0, std::ptr::null(), std::ptr::null_mut());
-            if err != 0 {
-                return Err(format!("clEnqueueNDRangeKernel error: {}", err));
+            if is_v2 {
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 0, 8, &self.d_prefix as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 1, 4, &p_len as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 2, 8, &self.d_suffix as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 3, 4, &s_len as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 4, 8, &self.d_seed as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 5, 4, &sd_len as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 6, 4, &t_diff as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 7, 8, &t_u64 as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 8, 8, &b_nonce as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 9, 4, &n_per_t as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 10, 8, &self.d_found_count as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel_v2, 11, 8, &self.d_found_nonces as *const _ as *const c_void);
+
+                let global_work = self.total_threads;
+                let err = (cl.cl_enqueue_nd_range_kernel)(self.queue, self.kernel_v2, 1, std::ptr::null(), &global_work, std::ptr::null(), 0, std::ptr::null(), std::ptr::null_mut());
+                if err != 0 {
+                    return Err(format!("clEnqueueNDRangeKernel cortex_opencl_mine_v2 error: {}", err));
+                }
+            } else {
+                (cl.cl_set_kernel_arg)(self.kernel, 0, 8, &self.d_prefix as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 1, 4, &p_len as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 2, 8, &self.d_suffix as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 3, 4, &s_len as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 4, 8, &self.d_seed as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 5, 4, &sd_len as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 6, 4, &t_diff as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 7, 8, &t_u64 as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 8, 8, &b_nonce as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 9, 4, &n_per_t as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 10, 8, &self.d_scratchpads as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 11, 8, &self.d_found_count as *const _ as *const c_void);
+                (cl.cl_set_kernel_arg)(self.kernel, 12, 8, &self.d_found_nonces as *const _ as *const c_void);
+
+                let global_work = self.total_threads;
+                let err = (cl.cl_enqueue_nd_range_kernel)(self.queue, self.kernel, 1, std::ptr::null(), &global_work, std::ptr::null(), 0, std::ptr::null(), std::ptr::null_mut());
+                if err != 0 {
+                    return Err(format!("clEnqueueNDRangeKernel error: {}", err));
+                }
             }
 
             let mut h_count: i32 = 0;
@@ -407,6 +443,7 @@ impl Drop for OpenClWorker {
             (cl.cl_release_mem_object)(self.d_scratchpads);
             (cl.cl_release_mem_object)(self.d_found_count);
             (cl.cl_release_mem_object)(self.d_found_nonces);
+            (cl.cl_release_kernel)(self.kernel_v2);
             (cl.cl_release_kernel)(self.kernel);
             (cl.cl_release_program)(self.program);
             (cl.cl_release_command_queue)(self.queue);
@@ -500,17 +537,63 @@ pub fn opencl_self_test(device_info: &OpenClDeviceInfo) -> bool {
         (cl.cl_enqueue_read_buffer)(queue, d_out, 1, 0, 32, res99k.as_mut_ptr() as *mut c_void, 0, std::ptr::null(), std::ptr::null_mut());
 
         let exp99k = hex::decode("912f8cb7ed73773658af2f4212aa40bb365d1a5a208eb09cd66e567b3cf70a5c").unwrap();
+        if res99k != exp99k.as_slice() {
+            (cl.cl_release_mem_object)(d_hdr123);
+            (cl.cl_release_mem_object)(d_hdr99k);
+            (cl.cl_release_mem_object)(d_seed);
+            (cl.cl_release_mem_object)(d_sp);
+            (cl.cl_release_mem_object)(d_out);
+            (cl.cl_release_kernel)(kernel);
+            (cl.cl_release_program)(program);
+            (cl.cl_release_command_queue)(queue);
+            (cl.cl_release_context)(context);
+            return false;
+        }
+
+        // Test Vector v2.1 Hard Fork
+        let k_v2_name = CString::new("test_opencl_v2_hash").unwrap();
+        let kernel_v2 = (cl.cl_create_kernel)(program, k_v2_name.as_ptr(), &mut err);
+        if err != 0 || kernel_v2.is_null() {
+            (cl.cl_release_mem_object)(d_hdr123);
+            (cl.cl_release_mem_object)(d_hdr99k);
+            (cl.cl_release_mem_object)(d_seed);
+            (cl.cl_release_mem_object)(d_sp);
+            (cl.cl_release_mem_object)(d_out);
+            (cl.cl_release_kernel)(kernel);
+            (cl.cl_release_program)(program);
+            (cl.cl_release_command_queue)(queue);
+            (cl.cl_release_context)(context);
+            return false;
+        }
+
+        let seed_v2 = b"reticulum-randomx-v2-epoch-17";
+        let d_seed_v2 = (cl.cl_create_buffer)(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, seed_v2.len(), seed_v2.as_ptr() as *mut c_void, &mut err);
+
+        let s_v2_len = seed_v2.len() as i32;
+        (cl.cl_set_kernel_arg)(kernel_v2, 0, 8, &d_hdr123 as *const _ as *const c_void);
+        (cl.cl_set_kernel_arg)(kernel_v2, 1, 4, &h123_len as *const _ as *const c_void);
+        (cl.cl_set_kernel_arg)(kernel_v2, 2, 8, &d_seed_v2 as *const _ as *const c_void);
+        (cl.cl_set_kernel_arg)(kernel_v2, 3, 4, &s_v2_len as *const _ as *const c_void);
+        (cl.cl_set_kernel_arg)(kernel_v2, 4, 8, &d_out as *const _ as *const c_void);
+
+        (cl.cl_enqueue_nd_range_kernel)(queue, kernel_v2, 1, std::ptr::null(), &work, std::ptr::null(), 0, std::ptr::null(), std::ptr::null_mut());
+        let mut res_v2 = [0u8; 32];
+        (cl.cl_enqueue_read_buffer)(queue, d_out, 1, 0, 32, res_v2.as_mut_ptr() as *mut c_void, 0, std::ptr::null(), std::ptr::null_mut());
+
+        let exp_v2 = hex::decode("4a26d092a483607da818f9e276db2c5d9624e89dab9be5462b7968079e6bf22f").unwrap();
 
         (cl.cl_release_mem_object)(d_hdr123);
         (cl.cl_release_mem_object)(d_hdr99k);
         (cl.cl_release_mem_object)(d_seed);
+        (cl.cl_release_mem_object)(d_seed_v2);
         (cl.cl_release_mem_object)(d_sp);
         (cl.cl_release_mem_object)(d_out);
+        (cl.cl_release_kernel)(kernel_v2);
         (cl.cl_release_kernel)(kernel);
         (cl.cl_release_program)(program);
         (cl.cl_release_command_queue)(queue);
         (cl.cl_release_context)(context);
 
-        res99k == exp99k.as_slice()
+        res_v2 == exp_v2.as_slice()
     }
 }

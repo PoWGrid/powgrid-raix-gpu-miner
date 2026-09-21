@@ -256,10 +256,11 @@ __device__ __forceinline__ int64_t v2_get_word(
     const int64_t writeCacheVal[48],
     uint32_t writeCacheCount
 ) {
+    if (idx < 64) return spongeHead[idx];
+
     for (uint32_t c = 0; c < writeCacheCount; c++) {
         if (writeCacheAddr[c] == idx) return writeCacheVal[c];
     }
-    if (idx < 64) return spongeHead[idx];
 
     uint32_t blockIdx = idx >> 1;
     uint32_t in_blk[4] = { 0, 0, 0, blockIdx };
@@ -285,10 +286,13 @@ __device__ __forceinline__ void v2_set_word(
     int64_t writeCacheVal[48],
     uint32_t* writeCacheCount
 ) {
+    if (idx < 64) {
+        spongeHead[idx] = val;
+        return;
+    }
     for (uint32_t c = 0; c < *writeCacheCount; c++) {
         if (writeCacheAddr[c] == idx) {
             writeCacheVal[c] = val;
-            if (idx < 64) spongeHead[idx] = val;
             return;
         }
     }
@@ -296,9 +300,6 @@ __device__ __forceinline__ void v2_set_word(
         writeCacheAddr[*writeCacheCount] = idx;
         writeCacheVal[*writeCacheCount] = val;
         (*writeCacheCount)++;
-    }
-    if (idx < 64) {
-        spongeHead[idx] = val;
     }
 }
 
@@ -519,7 +520,7 @@ __global__ void cortex_mine_v2_kernel(
 
         uint64_t nonce = thread_base + (uint64_t)n;
 
-        char header[512];
+        char header[384];
         for (int i = 0; i < prefix_len; i++) header[i] = d_prefix[i];
         int nonce_len = u64_to_str(nonce, header + prefix_len);
         int cur_len = prefix_len + nonce_len;
@@ -527,7 +528,7 @@ __global__ void cortex_mine_v2_kernel(
         int header_len = cur_len + suffix_len;
 
         // 1. seed_key = sha256(header + ":" + seed)
-        uint8_t hs_buf[512];
+        uint8_t hs_buf[384];
         for (int i = 0; i < header_len; i++) hs_buf[i] = (uint8_t)header[i];
         hs_buf[header_len] = ':';
         for (int i = 0; i < seed_len; i++) hs_buf[header_len + 1 + i] = (uint8_t)d_seed[i];
@@ -537,7 +538,7 @@ __global__ void cortex_mine_v2_kernel(
         cuda_sha256(hs_buf, hs_len, seed_key);
 
         // 2. initial_digest = sha512(seed + ":" + header)
-        uint8_t sh_buf[512];
+        uint8_t sh_buf[384];
         for (int i = 0; i < seed_len; i++) sh_buf[i] = (uint8_t)d_seed[i];
         sh_buf[seed_len] = ':';
         for (int i = 0; i < header_len; i++) sh_buf[seed_len + 1 + i] = (uint8_t)header[i];
@@ -811,7 +812,7 @@ __global__ void cortex_test_v2_kernel(
     uint8_t* d_out_hash
 ) {
     // 1. seed_key = sha256(header + ":" + seed)
-    uint8_t hs_buf[512];
+    uint8_t hs_buf[384];
     for (int i = 0; i < header_len; i++) hs_buf[i] = (uint8_t)d_header[i];
     hs_buf[header_len] = ':';
     for (int i = 0; i < seed_len; i++) hs_buf[header_len + 1 + i] = (uint8_t)d_seed[i];
@@ -821,7 +822,7 @@ __global__ void cortex_test_v2_kernel(
     cuda_sha256(hs_buf, hs_len, seed_key);
 
     // 2. initial_digest = sha512(seed + ":" + header)
-    uint8_t sh_buf[512];
+    uint8_t sh_buf[384];
     for (int i = 0; i < seed_len; i++) sh_buf[i] = (uint8_t)d_seed[i];
     sh_buf[seed_len] = ':';
     for (int i = 0; i < header_len; i++) sh_buf[seed_len + 1 + i] = (uint8_t)d_header[i];
